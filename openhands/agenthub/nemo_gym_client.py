@@ -86,6 +86,15 @@ class NemoGymClient:
             "prompt_token_ids",
             "generation_token_ids",
             "generation_log_probs",
+            "routed_experts",
+        ]
+        # routed_experts is only present when R3 is on; detecting the last occurrence must
+        # stay keyed on the always-present TITO fields, or a non-R3 run would never find a
+        # match and strip prompt_token_ids/generation_token_ids from every message.
+        tito_required_fields = [
+            "prompt_token_ids",
+            "generation_token_ids",
+            "generation_log_probs",
         ]
         last_occurrence_idx_seen = False
         for message in reversed(message_dicts):
@@ -93,7 +102,7 @@ class NemoGymClient:
                 for field in fields_to_remove:
                     if field in message:
                         del message[field]
-            elif all(field in message for field in fields_to_remove):
+            elif all(field in message for field in tito_required_fields):
                 last_occurrence_idx_seen = True
 
         # Measure per-call round-trip latency so it's surfaced in
@@ -125,6 +134,9 @@ class NemoGymClient:
                 "generation_token_ids": response_message_dict["generation_token_ids"],
                 "generation_log_probs": response_message_dict["generation_log_probs"],
             }
+            # R3: only present when router_replay/enable_return_routed_experts is on.
+            if response_message_dict.get("routed_experts") is not None:
+                provider_specific_fields["routed_experts"] = response_message_dict["routed_experts"]
             response._provider_specific_fields = provider_specific_fields
 
         self._log_completion(

@@ -290,14 +290,21 @@ class LLM(RetryMixin, DebugMixin):
             else:
                 messages = cast(list[dict[str, Any]], messages_list)
 
-            # Remove prompt_token_ids, generation_token_ids, and generation_log_probs from all messages except the last
+            # Remove prompt_token_ids, generation_token_ids, generation_log_probs, and routed_experts
+            # from all messages except the last.
             # Store removed fields so we can restore them after the completion call
-            fields_to_remove = ["prompt_token_ids", "generation_token_ids", "generation_log_probs"]
+            fields_to_remove = ["prompt_token_ids", "generation_token_ids", "generation_log_probs", "routed_experts"]
             removed_fields: dict[int, dict[str, Any]] = {}
 
+            # Detect the last occurrence using only the always-present TITO fields:
+            # routed_experts is absent whenever R3 is off, and requiring it here would make
+            # `all(...)` never match on non-R3 runs, so last_occurrence_idx would stay -1 and
+            # the loop below would strip prompt_token_ids/generation_token_ids from EVERY
+            # message (including the one that must keep them), silently breaking TITO.
+            tito_required_fields = ["prompt_token_ids", "generation_token_ids", "generation_log_probs"]
             last_occurrence_idx = -1
             for i, message in enumerate(reversed(messages)):
-                if all(field in message for field in fields_to_remove):
+                if all(field in message for field in tito_required_fields):
                     last_occurrence_idx = len(messages) - i - 1
                     break
 

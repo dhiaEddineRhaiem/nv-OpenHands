@@ -328,6 +328,7 @@ class ConversationMemory:
                 generation_log_probs=provider_specific_fields.get(
                     'generation_log_probs'
                 ),
+                routed_experts=provider_specific_fields.get('routed_experts'),
             )
             return []
         elif isinstance(action, AgentFinishAction):
@@ -396,6 +397,7 @@ class ConversationMemory:
                     generation_log_probs=provider_specific_fields.get(
                         'generation_log_probs'
                     ),
+                    routed_experts=provider_specific_fields.get('routed_experts'),
                 )
             ]
         elif isinstance(action, CmdRunAction) and action.source == 'user':

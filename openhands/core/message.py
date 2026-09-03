@@ -70,6 +70,8 @@ class Message(BaseModel):
     prompt_token_ids: list[int] | None = None
     generation_token_ids: list[int] | None = None
     generation_log_probs: list[float] | None = None
+    # R3 (router replay): per-token expert routes, shape [tokens][moe_layers][topk]
+    routed_experts: list[list[list[int]]] | None = None
 
     @property
     def contains_image(self) -> bool:
@@ -166,5 +168,7 @@ class Message(BaseModel):
             message_dict['generation_token_ids'] = self.generation_token_ids
         if self.generation_log_probs is not None:
             message_dict['generation_log_probs'] = self.generation_log_probs
+        if self.routed_experts is not None:
+            message_dict['routed_experts'] = self.routed_experts
 
         return message_dict
