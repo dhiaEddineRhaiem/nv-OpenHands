@@ -2018,9 +2018,10 @@ if __name__ == '__main__':
             output_file,
             args.eval_num_workers,
             process_instance,
-            timeout_seconds=8
-            * 60
-            * 60,  # 8 hour PER instance should be more than enough
+            timeout_seconds=int(
+                os.environ.get('EVAL_INSTANCE_TIMEOUT_SEC', str(8 * 60 * 60))
+            ),  # per-ATTEMPT cap; set below the harness's outer reaper so a wedged
+            # attempt ends as a clean EvalOutput error instead of a hard kill
             max_retries=MAX_RETRIES,
         )
     else:
@@ -2067,9 +2068,9 @@ if __name__ == '__main__':
                 cur_output_file,
                 args.eval_num_workers,
                 process_instance,
-                timeout_seconds=8
-                * 60
-                * 60,  # 8 hour PER instance should be more than enough
+                timeout_seconds=int(
+                    os.environ.get('EVAL_INSTANCE_TIMEOUT_SEC', str(8 * 60 * 60))
+                ),  # see EVAL_INSTANCE_TIMEOUT_SEC note at the first call site
                 max_retries=MAX_RETRIES,
             )
 
