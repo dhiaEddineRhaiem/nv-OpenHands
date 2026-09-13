@@ -528,6 +528,25 @@ class AgentController:
             return
 
         elif isinstance(action, AgentFinishAction):
+            # NeMo nudge-on-empty (2026-09-13, gated; profiling: 4.9% of rollouts
+            # finish with an empty git diff): if no successful file modification is
+            # visible in history, inject ONE user nudge instead of finishing.
+            if _nemo_should_nudge_on_empty(self.state.history) and not getattr(
+                self, '_nemo_nudged', False
+            ):
+                self._nemo_nudged = True
+                self.event_stream.add_event(
+                    MessageAction(
+                        content=(
+                            'You finished without modifying any files, so no patch '
+                            'would be produced and the task would fail. Apply your '
+                            'code changes to the repository files first, then finish '
+                            'again.'
+                        )
+                    ),
+                    EventSource.USER,
+                )
+                return
             self.state.outputs = action.outputs
             await self.set_agent_state_to(AgentState.FINISHED)
         elif isinstance(action, AgentRejectAction):
@@ -1393,3 +1412,29 @@ Agent is now continuing with the same task...
 
     def save_state(self):
         self.state_tracker.save_state()
+
+
+def _nemo_should_nudge_on_empty(history) -> bool:
+    """True iff the nudge gate is on and history shows no successful file edit.
+
+    Gate: flag file OpenHands/NUDGE_ON (env does not survive apptainer spawn
+    sanitization; the flag file lives in the bind so every sandbox sees it) or
+    env OH_NUDGE_ON_EMPTY. Heuristic: any FileEditObservation/FileWriteObservation
+    counts as a real edit (bash-redirect edits are invisible here -- those episodes
+    get one spurious nudge, capped at one, then finish normally).
+    """
+    import os as _os
+
+    _flag = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))),
+        'NUDGE_ON',
+    )
+    if not (
+        _os.environ.get('OH_NUDGE_ON_EMPTY', '') in ('1', 'true')
+        or _os.path.exists(_flag)
+    ):
+        return False
+    for ev in history or []:
+        if type(ev).__name__ in ('FileEditObservation', 'FileWriteObservation'):
+            return False
+    return True

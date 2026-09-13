@@ -82,6 +82,22 @@ def response_to_actions(
     choice = response.choices[0]
     assistant_msg = choice.message
 
+    # NeMo lenient tool-call recovery (2026-09-13, gated): late-episode models drift
+    # into malformed tool syntax ('<tool_call>{...}</invoke>' etc.) that defeats the
+    # server-side hermes parser, leaving tool_calls empty while the content clearly
+    # contains an intended call. Recover well-formed JSON objects that follow each
+    # '<tool_call>' marker and synthesize real tool calls from them.
+    _msg0 = getattr(response.choices[0], 'message')
+    if (
+        (not (hasattr(_msg0, 'tool_calls') and _msg0.tool_calls))
+        and getattr(_msg0, 'content', None)
+        and '<tool_call>' in _msg0.content
+        and _nemo_lenient_enabled()
+    ):
+        _recovered = _nemo_recover_tool_calls(_msg0.content)
+        if _recovered:
+            _msg0.tool_calls = _recovered
+
     # Check if both content and tool_calls are None - this indicates context length has been hit
     has_content = assistant_msg.content is not None
     has_tool_calls = hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls
@@ -374,3 +390,58 @@ def response_to_actions(
 
     assert len(actions) >= 1
     return actions
+
+
+def _nemo_lenient_enabled() -> bool:
+    import os as _os
+
+    _flag = _os.path.join(
+        _os.path.dirname(
+            _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        ),
+        'LENIENT_ON',
+    )
+    return _os.environ.get('OH_LENIENT_TOOLCALLS', '') in ('1', 'true') or _os.path.exists(
+        _flag
+    )
+
+
+def _nemo_recover_tool_calls(content: str):
+    """Extract tool calls from malformed '<tool_call>' text. Returns litellm
+    ChatCompletionMessageToolCall list or None. Only accepts objects shaped like
+    {"name": str, "arguments": dict|str}; caps at 2 recovered calls."""
+    import json as _json
+
+    from litellm import ChatCompletionMessageToolCall
+
+    decoder = _json.JSONDecoder()
+    calls = []
+    pos = 0
+    while len(calls) < 2:
+        marker = content.find('<tool_call>', pos)
+        if marker == -1:
+            break
+        brace = content.find('{', marker)
+        if brace == -1:
+            break
+        try:
+            obj, _end = decoder.raw_decode(content[brace:])
+        except ValueError:
+            pos = marker + len('<tool_call>')
+            continue
+        pos = brace + _end
+        if not isinstance(obj, dict) or not isinstance(obj.get('name'), str):
+            continue
+        args = obj.get('arguments', {})
+        if isinstance(args, dict):
+            args = _json.dumps(args)
+        elif not isinstance(args, str):
+            continue
+        calls.append(
+            ChatCompletionMessageToolCall(
+                id=f'nemo_lenient_{len(calls)}',
+                type='function',
+                function={'name': obj['name'], 'arguments': args},
+            )
+        )
+    return calls or None

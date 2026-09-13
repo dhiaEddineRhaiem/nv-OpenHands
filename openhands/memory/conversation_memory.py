@@ -1,3 +1,4 @@
+import os
 from typing import Generator
 
 from litellm import ModelResponse
@@ -307,6 +308,34 @@ class ConversationMemory:
             llm_response: ModelResponse = tool_metadata.model_response
             assistant_msg = getattr(llm_response.choices[0], 'message')
 
+            # NeMo interleaved thinking (2026-09-11, harbor_agent parity):
+            # carry each turn's parsed reasoning back into that turn's history
+            # message as an inline <think> block. The falcon chat template's
+            # inline-think normalization splits it back into reasoning_content
+            # at render time. Episode-scoped by construction (fresh history
+            # per rollout) => interleaved, not preserved. Gated, default off.
+            _think_prefix = ''
+            if (
+                os.environ.get('OH_INTERLEAVED_THINKING', '') in ('1', 'true', 'all')
+                or os.path.exists('/openhands_setup/OpenHands/INTERLEAVED_ON')
+                or os.path.exists('/mnt/falcon-moe-rl/debug-nemo-rl-swe-opd/gym_shared/2af0e45ef40a1ea9703eb365799b881666ec1189/responses_api_agents/swe_agents/swe_openhands_setup/OpenHands/INTERLEAVED_ON')
+            ):
+                _rsn = getattr(assistant_msg, 'reasoning_content', None)
+                if _rsn is None and hasattr(assistant_msg, 'get'):
+                    try:
+                        _rsn = assistant_msg.get('reasoning_content')
+                    except Exception:
+                        _rsn = None
+                if isinstance(_rsn, str) and _rsn.strip():
+                    _rsn = _rsn.replace('<think>', '').replace('</think>', '')
+                    try:
+                        _max = int(os.environ.get('OH_THINKING_MAX_CHARS', '0') or 0)
+                    except ValueError:
+                        _max = 0
+                    if _max > 0 and len(_rsn) > _max:
+                        _rsn = _rsn[:_max] + '\n[...reasoning truncated...]'
+                    _think_prefix = '<think>' + _rsn + '</think>\n'
+
             # Extract provider_specific_fields if available
             provider_specific_fields = getattr(
                 llm_response, '_provider_specific_fields', {}
@@ -317,8 +346,13 @@ class ConversationMemory:
             pending_tool_call_action_messages[llm_response.id] = Message(
                 role=getattr(assistant_msg, 'role', 'assistant'),
                 # tool call content SHOULD BE a string
-                content=[TextContent(text=assistant_msg.content)]
-                if assistant_msg.content and assistant_msg.content.strip()
+                content=[
+                    TextContent(text=_think_prefix + (assistant_msg.content or ''))
+                ]
+                if (
+                    (assistant_msg.content and assistant_msg.content.strip())
+                    or _think_prefix
+                )
                 else [],
                 tool_calls=assistant_msg.tool_calls,
                 prompt_token_ids=provider_specific_fields.get('prompt_token_ids'),

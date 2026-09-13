@@ -1641,19 +1641,104 @@ def process_instance(
 
         # Here's how you can run the agent (similar to the `main` function) and get the final task state
         start_time = time.perf_counter()
-        state: State | None = asyncio.run(
-            run_controller(
-                config=config,
-                initial_user_action=message_action,
-                runtime=runtime,
-                fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
-                    metadata.agent_class
-                ],
-                replay_events=replay_events,
+        async def _run_controller_with_startup_watchdog():
+            # NeMo profiling fix (2026-09-10): detect the run_controller
+            # startup wedge -- the agent never emits its first event because
+            # the initial-action/subscriber race was lost -- and raise
+            # EvalException so the standard eval retry machinery re-runs this
+            # instance instead of sleeping until swebench_agent_timeout.
+            _watchdog_s = float(os.environ.get('NG_STARTUP_WATCHDOG_S', '420'))
+            _initial_event_id = -1
+            try:
+                _initial_event_id = runtime.event_stream.get_latest_event_id()
+            except Exception:
+                pass
+            _controller_task = asyncio.get_running_loop().create_task(
+                run_controller(
+                    config=config,
+                    initial_user_action=message_action,
+                    runtime=runtime,
+                    fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
+                        metadata.agent_class
+                    ],
+                    replay_events=replay_events,
+                )
             )
-        )
+            _done, _pending = await asyncio.wait({_controller_task}, timeout=_watchdog_s)
+            if not _done:
+                # v2: type/source filtering is unreliable (startup emits
+                # agent-sourced state-change noise). Use event-count growth:
+                # a live episode reaches initial+4 (statechange, user msg,
+                # first action, first observation) within minutes; a wedged
+                # one is frozen at its startup events forever.
+                _latest_event_id = -1
+                try:
+                    _latest_event_id = runtime.event_stream.get_latest_event_id()
+                except Exception:
+                    pass
+                try:
+                    _classes = [
+                        type(_ev).__name__ + '/' + str(getattr(getattr(_ev, 'source', None), 'value', getattr(_ev, 'source', None)))
+                        for _ev in runtime.event_stream.get_events()
+                    ][:12]
+                except Exception as _e:
+                    _classes = ['<introspection failed: %s>' % _e]
+                print(
+                    f'startup watchdog check: initial_id={_initial_event_id} '
+                    f'latest_id={_latest_event_id} events={_classes}',
+                    flush=True,
+                )
+                # v3 (calibrated 2026-09-10): wedged episodes freeze at exactly
+                # ids 0-4 (SystemMessage, user Message, Recall pair, state change);
+                # the first real agent step lands at id 5+ within minutes. Absolute
+                # threshold -- the stream does not exist before run_controller
+                # starts, so pre-captured initial_id was always -1 (neutered v2).
+                _has_agent_event = _latest_event_id < 0 or _latest_event_id > 5
+                if not _has_agent_event:
+                    print(
+                        f'startup watchdog: no agent event after {_watchdog_s:.0f}s '
+                        f'(initial_event_id={_initial_event_id}); aborting for retry',
+                        flush=True,
+                    )
+                    _controller_task.cancel()
+                    try:
+                        await _controller_task
+                    except BaseException:
+                        pass
+                    try:
+                        import shutil as _shutil
+                        if os.path.isdir(eval_sessions_dir):
+                            for _sd in os.listdir(eval_sessions_dir):
+                                if _sd not in pre_existing_sessions:
+                                    _shutil.rmtree(os.path.join(eval_sessions_dir, _sd), ignore_errors=True)
+                    except Exception:
+                        pass
+                    raise EvalException(
+                        'Startup watchdog: agent produced no events after '
+                        f'{_watchdog_s:.0f}s - run_controller startup wedge'
+                    )
+            return await _controller_task
+
+        state: State | None = asyncio.run(_run_controller_with_startup_watchdog())
         end_time = time.perf_counter()
         print(f"run controller: {end_time - start_time} seconds", flush = True)
+        _rc_elapsed = end_time - start_time
+        if _rc_elapsed < 60.0:
+            _rc_last_id = -1
+            try:
+                _rc_last_id = runtime.event_stream.get_latest_event_id()
+            except Exception:
+                pass
+            if 0 <= _rc_last_id <= 5:
+                print(
+                    f'instant-return guard: run_controller returned in {_rc_elapsed:.1f}s '
+                    f'with latest_event_id={_rc_last_id}; aborting for retry',
+                    flush=True,
+                )
+                raise EvalException(
+                    'Instant-return guard: controller returned in '
+                    f'{_rc_elapsed:.1f}s with no agent events (id={_rc_last_id})'
+                )
 
         # if fatal error, throw EvalError to trigger re-run
         if is_fatal_evaluation_error(state.last_error):
