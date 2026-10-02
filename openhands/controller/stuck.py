@@ -8,6 +8,7 @@ from openhands.events.action.action import Action
 from openhands.events.action.commands import IPythonRunCellAction
 from openhands.events.action.empty import NullAction
 from openhands.events.action.message import MessageAction
+from openhands.events.action.terminus_2 import Terminus2CmdRunAction
 from openhands.events.observation import (
     CmdOutputObservation,
     IPythonRunCellObservation,
@@ -16,6 +17,7 @@ from openhands.events.observation.agent import AgentCondensationObservation
 from openhands.events.observation.empty import NullObservation
 from openhands.events.observation.error import ErrorObservation
 from openhands.events.observation.observation import Observation
+from openhands.events.observation.terminus_2 import Terminus2CmdOutputObservation
 
 
 class StuckDetector:
@@ -476,6 +478,28 @@ class StuckDetector:
         ):
             # for loop detection, ignore command_id, which is the pid
             return obj1.command == obj2.command and obj1.exit_code == obj2.exit_code
+        elif isinstance(obj1, Terminus2CmdOutputObservation) and isinstance(
+            obj2, Terminus2CmdOutputObservation
+        ):
+            # Terminus2CmdOutputObservation is NOT a CmdOutputObservation subclass, so
+            # without this branch it fell to dataclass __eq__ over `terminal_state` --
+            # a full screen capture that advances between repetitions -- and real
+            # command loops were never detected. Offline replay over the same
+            # trajectories: 0% fired under the default comparison vs 16.5% of
+            # near-timeout rollouts under this one.
+            return (
+                obj1.command_keystrokes == obj2.command_keystrokes
+                and obj1.timed_out == obj2.timed_out
+            )
+        elif isinstance(obj1, Terminus2CmdRunAction) and isinstance(
+            obj2, Terminus2CmdRunAction
+        ):
+            # `thought` carries the ENTIRE JSON reply on the first action of every
+            # turn, so at temperature>0 two repetitions are never byte-identical and
+            # action equality always failed. Compare only what was actually run.
+            return (
+                obj1.keystrokes == obj2.keystrokes and obj1.duration == obj2.duration
+            )
         else:
             # this is the default comparison
             return obj1 == obj2

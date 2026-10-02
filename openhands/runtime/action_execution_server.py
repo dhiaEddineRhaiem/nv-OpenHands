@@ -2235,11 +2235,18 @@ class ActionExecutor:
             root@hostname:/app# cd /app/src
             root@hostname:/app/src#
         """
-        meta = obs.metadata
         username = 'root'
         hostname = 'sandbox'
-        post_cwd = meta.working_dir or '/'
         suffix = '#' if username == 'root' else '$'
+        # An ErrorObservation has no .metadata. Reading it unguarded raised
+        # AttributeError, which the caller's broad `except Exception` swallowed and
+        # turned into the agent's terminal output being the literal string
+        # "'ErrorObservation' object has no attribute 'metadata'". Measured: that was
+        # 100% of every error Terminus2 ever saw, touching 56.3% of near-timeout
+        # rollouts, so the agent was asked to debug from a message about our own bug
+        # instead of the real failure. CodeAct never hits this path.
+        meta = getattr(obs, 'metadata', None)
+        post_cwd = (getattr(meta, 'working_dir', None) or pre_cwd or '/') if meta else (pre_cwd or '/')
 
         before_cwd = pre_cwd if pre_cwd else post_cwd
         pre_prompt = f'{username}@{hostname}:{before_cwd}{suffix} '

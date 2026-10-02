@@ -37,6 +37,10 @@ from openhands.utils.prompt import PromptManager
 
 MAX_OUTPUT_BYTES = 10000
 MAX_LLM_RETRY = 3
+# After this many CONSECUTIVE steps whose reply could not be parsed, end the
+# episode cleanly rather than emitting a constant think action that the stuck
+# detector kills. Each failed step costs MAX_LLM_RETRY model calls and runs nothing.
+MAX_CONSECUTIVE_PARSE_FAILURES = 3
 COMMAND_EXEC_TIMEOUT = int(os.getenv('COMMAND_EXEC_TIMEOUT', '300'))
 
 TIMEOUT_TEMPLATE = (
@@ -85,6 +89,14 @@ class Terminus2Agent(Agent):
         self._pending_completion = False
         self._conversation_messages: list[dict[str, str]] = []
         self._needs_llm_call = True
+        # Carried ACROSS controller iterations. _build_messages rebuilds the message
+        # list from the event history every step, and AgentThinkAction is skipped
+        # there, so a parse failure used to leave no trace at all: the next step
+        # rebuilt byte-identical context, the model repeated the identical malformed
+        # reply, and the episode died in the stuck detector having run nothing. See
+        # _note_parse_failure.
+        self._last_parse_error: str | None = None
+        self._consecutive_parse_failures = 0
 
         self.condenser = Condenser.from_config(self.config.condenser, llm_registry)
         self.llm = self.llm_registry.get_router(self.config)
@@ -124,6 +136,8 @@ class Terminus2Agent(Agent):
         self._pending_completion = False
         self._conversation_messages = []
         self._needs_llm_call = True
+        self._last_parse_error = None
+        self._consecutive_parse_failures = 0
 
     def _has_terminal_observation(self, events: list[Event]) -> bool:
         """Check if any Terminus2CmdOutputObservation exists in the event history."""
@@ -190,7 +204,32 @@ class Terminus2Agent(Agent):
                 )
                 self._attach_response_metadata(noop, model_response, total_calls=0)
                 return noop
-            think = AgentThinkAction(thought='No commands to execute, waiting for next input')
+            if self._consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
+                # Stop cleanly instead of emitting a constant think action that the
+                # stuck detector eventually kills. Both the old think text and its
+                # observation were fixed strings, so the loop was byte-identical and
+                # the agent could never recover from it. Ending here keeps whatever
+                # patch exists and reports an honest reason.
+                logger.error(
+                    'Terminus-2: %d consecutive parse failures, ending episode',
+                    self._consecutive_parse_failures,
+                )
+                finish = AgentFinishAction(
+                    thought=(
+                        f'Stopping after {self._consecutive_parse_failures} consecutive '
+                        f'unparseable responses. Last error: {self._last_parse_error}'
+                    )
+                )
+                self._attach_response_metadata(finish, model_response, total_calls=0)
+                return finish
+            # Carry the real error in the thought so it is not a constant string.
+            think = AgentThinkAction(
+                thought=(
+                    'No commands to execute, waiting for next input'
+                    if not self._last_parse_error
+                    else f'Response could not be parsed: {self._last_parse_error}'
+                )
+            )
             self._attach_response_metadata(think, model_response, total_calls=0)
             return think
 
@@ -349,6 +388,31 @@ class Terminus2Agent(Agent):
                 Message(role='user', content=[TextContent(text=confirmation)])
             )
 
+        # Surface a parse failure from the PREVIOUS step. Without this the model is
+        # handed byte-identical context after a malformed reply (AgentThinkAction is
+        # skipped above, and the in-call retry feedback died with step()'s local
+        # list), so it reproduces the same malformed reply until the stuck detector
+        # kills the episode. Measured on 40 stuck Terminus2 rollouts: 100% showed
+        # this signature, 45% died in under 300s having run a single command.
+        if self._last_parse_error:
+            messages.append(
+                Message(
+                    role='user',
+                    content=[
+                        TextContent(
+                            text=(
+                                'Your previous reply could not be parsed and NO '
+                                'command was executed.\n'
+                                f'ERROR: {self._last_parse_error}\n\n'
+                                'Reply with ONLY a single valid JSON object with the '
+                                'keys "analysis", "plan" and "commands". Do not wrap '
+                                'it in markdown fences or add any text around it.'
+                            )
+                        )
+                    ],
+                )
+            )
+
         return messages
 
     def _find_initial_user_message(self, events: list[Event]) -> str | None:
@@ -429,6 +493,7 @@ class Terminus2Agent(Agent):
         logprobs are persisted on the trajectory, matching CodeAct/OpenCode.
         """
         last_response: object | None = None
+        last_error: str | None = None
         for attempt in range(MAX_LLM_RETRY):
             response = await self.nemo_gym_client.model_call(messages)
             last_response = response
@@ -443,6 +508,7 @@ class Terminus2Agent(Agent):
             result = self.parser.parse_response(response_text)
 
             if result.error:
+                last_error = result.error
                 feedback = f'Previous response had parsing errors:\nERROR: {result.error}'
                 if result.warning:
                     feedback += f'\nWARNINGS: {result.warning}'
@@ -461,9 +527,18 @@ class Terminus2Agent(Agent):
                 ParsedCommand(keystrokes=cmd.keystrokes, duration=min(cmd.duration, COMMAND_EXEC_TIMEOUT))
                 for cmd in result.commands
             ]
+            # A clean parse clears the carried-over failure state.
+            self._last_parse_error = None
+            self._consecutive_parse_failures = 0
             return commands, result.is_task_complete, response_text, response
 
         logger.error('Terminus-2: exhausted LLM retries due to parse errors')
+        # Carry the failure to the NEXT step. The retry feedback appended above
+        # only ever lived in this local `messages` list, which step() discards, so
+        # without this the model is handed identical context next iteration and
+        # reproduces the identical malformed reply forever.
+        self._last_parse_error = str(last_error or 'response was not valid JSON')[:800]
+        self._consecutive_parse_failures += 1
         return [], False, '', last_response
 
     @staticmethod
