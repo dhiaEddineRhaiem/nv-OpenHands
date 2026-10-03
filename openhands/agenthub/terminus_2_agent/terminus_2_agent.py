@@ -51,14 +51,6 @@ MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # exactly this way, with a median of 5 and up to 9 identical thinks.
 MAX_CONSECUTIVE_NO_ACTION = 3
 
-# Appended to a terminal observation when the model re-issues a command it has already run.
-# It never repeats verbatim (the count changes), so it cannot itself become a stuck-detector
-# loop, and it gives the model the one fact it demonstrably is not deriving on its own.
-REPEATED_COMMAND_NOTICE = (
-    '\n\n[NOTE] You have already run this exact command {n} times in this session. '
-    'Its output is above and has not changed. Do not run it again; either act on the '
-    'output (edit a file) or run a DIFFERENT command.'
-)
 COMMAND_EXEC_TIMEOUT = int(os.getenv('COMMAND_EXEC_TIMEOUT', '300'))
 
 TIMEOUT_TEMPLATE = (
@@ -348,9 +340,6 @@ class Terminus2Agent(Agent):
         batch_observations: list[str] = []
         last_timed_out = False
         last_keystrokes = ''
-        # keystrokes -> how many times issued so far in this episode
-        seen_keystrokes: dict[str, int] = {}
-        last_repeat_count = 1
 
         for event in condensed_history:
             if isinstance(event, MessageAction):
@@ -362,8 +351,7 @@ class Terminus2Agent(Agent):
                             batch_observations
                         )
                         user_text = self._format_terminal_output(
-                            terminal_output, last_timed_out, last_keystrokes,
-                            last_repeat_count,
+                            terminal_output, last_timed_out, last_keystrokes
                         )
                         messages.append(
                             Message(role='user', content=[TextContent(text=user_text)])
@@ -382,8 +370,7 @@ class Terminus2Agent(Agent):
                             batch_observations
                         )
                         user_text = self._format_terminal_output(
-                            terminal_output, last_timed_out, last_keystrokes,
-                            last_repeat_count,
+                            terminal_output, last_timed_out, last_keystrokes
                         )
                         messages.append(
                             Message(role='user', content=[TextContent(text=user_text)])
@@ -395,12 +382,6 @@ class Terminus2Agent(Agent):
                         self._assistant_message_from_event(event, event.thought)
                     )
                 last_keystrokes = event.keystrokes
-                _k = (event.keystrokes or '').strip()
-                if _k:
-                    seen_keystrokes[_k] = seen_keystrokes.get(_k, 0) + 1
-                    last_repeat_count = seen_keystrokes[_k]
-                else:
-                    last_repeat_count = 1
 
             elif isinstance(event, Terminus2CmdOutputObservation):
                 if event is initial_terminal_event:
@@ -425,8 +406,7 @@ class Terminus2Agent(Agent):
                 )
             else:
                 user_text = self._format_terminal_output(
-                    terminal_output, last_timed_out, last_keystrokes,
-                    last_repeat_count,
+                    terminal_output, last_timed_out, last_keystrokes
                 )
                 messages.append(
                     Message(role='user', content=[TextContent(text=user_text)])
@@ -520,29 +500,16 @@ class Terminus2Agent(Agent):
         return last_prefix + '\n'.join(screens)
 
     def _format_terminal_output(
-        self, terminal_output: str, timed_out: bool, keystrokes: str, repeat_count: int = 1
+        self, terminal_output: str, timed_out: bool, keystrokes: str
     ) -> str:
-        """Format terminal output for the next user message.
-
-        ``repeat_count`` is how many times this exact command has now been run in the
-        episode. Above 1 we say so explicitly. The model already receives its own command
-        and the full output (verified over 54,939 observations: output is never empty,
-        median 1136 chars; and 99.8% of follow-on commands are echoed back inside the
-        first command's reply), yet it still re-issued an identical command in 79.3% of
-        stuck rollouts. So the missing ingredient is not the data but the inference, and
-        this states it outright rather than leaving it to be derived.
-        """
+        """Format terminal output for the next user message."""
         if timed_out:
-            text = TIMEOUT_TEMPLATE.format(
+            return TIMEOUT_TEMPLATE.format(
                 command=keystrokes,
                 timeout_sec=COMMAND_EXEC_TIMEOUT,
                 terminal_state=self._limit_output_length(terminal_output),
             )
-        else:
-            text = self._limit_output_length(terminal_output)
-        if repeat_count > 1:
-            text += REPEATED_COMMAND_NOTICE.format(n=repeat_count)
-        return text
+        return self._limit_output_length(terminal_output)
 
     async def _call_llm_and_parse(
         self, messages: list[Message]
