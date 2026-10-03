@@ -41,6 +41,24 @@ MAX_LLM_RETRY = 3
 # episode cleanly rather than emitting a constant think action that the stuck
 # detector kills. Each failed step costs MAX_LLM_RETRY model calls and runs nothing.
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
+# After this many CONSECUTIVE steps that produced no runnable command, end the episode.
+# This is a SEPARATE bound from the parse-failure one above, and it is the bound that
+# actually matters for a reply that parses CLEANLY but carries no command: in that case
+# `_last_parse_error` is None and `_consecutive_parse_failures` stays 0, so the parse bound
+# can never fire and the agent emitted the byte-identical think
+# 'No commands to execute, waiting for next input' forever until the stuck detector killed
+# it. Measured over all 242 stuck Terminus2 rollouts of run jxa0vi05: 32 (13.2%) died
+# exactly this way, with a median of 5 and up to 9 identical thinks.
+MAX_CONSECUTIVE_NO_ACTION = 3
+
+# Appended to a terminal observation when the model re-issues a command it has already run.
+# It never repeats verbatim (the count changes), so it cannot itself become a stuck-detector
+# loop, and it gives the model the one fact it demonstrably is not deriving on its own.
+REPEATED_COMMAND_NOTICE = (
+    '\n\n[NOTE] You have already run this exact command {n} times in this session. '
+    'Its output is above and has not changed. Do not run it again; either act on the '
+    'output (edit a file) or run a DIFFERENT command.'
+)
 COMMAND_EXEC_TIMEOUT = int(os.getenv('COMMAND_EXEC_TIMEOUT', '300'))
 
 TIMEOUT_TEMPLATE = (
@@ -97,6 +115,7 @@ class Terminus2Agent(Agent):
         # _note_parse_failure.
         self._last_parse_error: str | None = None
         self._consecutive_parse_failures = 0
+        self._consecutive_no_action = 0
 
         self.condenser = Condenser.from_config(self.config.condenser, llm_registry)
         self.llm = self.llm_registry.get_router(self.config)
@@ -138,6 +157,7 @@ class Terminus2Agent(Agent):
         self._needs_llm_call = True
         self._last_parse_error = None
         self._consecutive_parse_failures = 0
+        self._consecutive_no_action = 0
 
     def _has_terminal_observation(self, events: list[Event]) -> bool:
         """Check if any Terminus2CmdOutputObservation exists in the event history."""
@@ -204,35 +224,52 @@ class Terminus2Agent(Agent):
                 )
                 self._attach_response_metadata(noop, model_response, total_calls=0)
                 return noop
-            if self._consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
+            # A step that yields no runnable action makes no progress, whether the reply
+            # failed to parse or parsed cleanly with an empty command list. Count BOTH
+            # here: the parse counter is reset by any successful parse, so on its own it
+            # cannot bound the parses-fine-but-empty case.
+            self._consecutive_no_action += 1
+            if (
+                self._consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
+                or self._consecutive_no_action >= MAX_CONSECUTIVE_NO_ACTION
+            ):
                 # Stop cleanly instead of emitting a constant think action that the
                 # stuck detector eventually kills. Both the old think text and its
                 # observation were fixed strings, so the loop was byte-identical and
                 # the agent could never recover from it. Ending here keeps whatever
                 # patch exists and reports an honest reason.
-                logger.error(
-                    'Terminus-2: %d consecutive parse failures, ending episode',
-                    self._consecutive_parse_failures,
+                reason = (
+                    f'{self._consecutive_parse_failures} consecutive unparseable '
+                    f'responses (last error: {self._last_parse_error})'
+                    if self._consecutive_parse_failures
+                    >= MAX_CONSECUTIVE_PARSE_FAILURES
+                    else f'{self._consecutive_no_action} consecutive responses with no '
+                    f'runnable command'
                 )
-                finish = AgentFinishAction(
-                    thought=(
-                        f'Stopping after {self._consecutive_parse_failures} consecutive '
-                        f'unparseable responses. Last error: {self._last_parse_error}'
-                    )
-                )
+                logger.error('Terminus-2: %s, ending episode', reason)
+                finish = AgentFinishAction(thought=f'Stopping after {reason}.')
                 self._attach_response_metadata(finish, model_response, total_calls=0)
                 return finish
-            # Carry the real error in the thought so it is not a constant string.
+            # Never a constant string: it carries the real parse error when there is one,
+            # and otherwise the attempt counter plus what the model must actually do. A
+            # fixed string here is what the stuck detector latched onto.
             think = AgentThinkAction(
                 thought=(
-                    'No commands to execute, waiting for next input'
-                    if not self._last_parse_error
-                    else f'Response could not be parsed: {self._last_parse_error}'
+                    f'Response could not be parsed: {self._last_parse_error}'
+                    if self._last_parse_error
+                    else (
+                        f'Your last reply contained no runnable command '
+                        f'(attempt {self._consecutive_no_action} of '
+                        f'{MAX_CONSECUTIVE_NO_ACTION}). Reply with the JSON command '
+                        f'format, or finish the task if it is complete.'
+                    )
                 )
             )
             self._attach_response_metadata(think, model_response, total_calls=0)
             return think
 
+        # Reaching here means there IS an action to run, i.e. real progress.
+        self._consecutive_no_action = 0
         return self.pending_actions.popleft()
 
     @staticmethod
@@ -311,6 +348,9 @@ class Terminus2Agent(Agent):
         batch_observations: list[str] = []
         last_timed_out = False
         last_keystrokes = ''
+        # keystrokes -> how many times issued so far in this episode
+        seen_keystrokes: dict[str, int] = {}
+        last_repeat_count = 1
 
         for event in condensed_history:
             if isinstance(event, MessageAction):
@@ -322,7 +362,8 @@ class Terminus2Agent(Agent):
                             batch_observations
                         )
                         user_text = self._format_terminal_output(
-                            terminal_output, last_timed_out, last_keystrokes
+                            terminal_output, last_timed_out, last_keystrokes,
+                            last_repeat_count,
                         )
                         messages.append(
                             Message(role='user', content=[TextContent(text=user_text)])
@@ -341,7 +382,8 @@ class Terminus2Agent(Agent):
                             batch_observations
                         )
                         user_text = self._format_terminal_output(
-                            terminal_output, last_timed_out, last_keystrokes
+                            terminal_output, last_timed_out, last_keystrokes,
+                            last_repeat_count,
                         )
                         messages.append(
                             Message(role='user', content=[TextContent(text=user_text)])
@@ -353,6 +395,12 @@ class Terminus2Agent(Agent):
                         self._assistant_message_from_event(event, event.thought)
                     )
                 last_keystrokes = event.keystrokes
+                _k = (event.keystrokes or '').strip()
+                if _k:
+                    seen_keystrokes[_k] = seen_keystrokes.get(_k, 0) + 1
+                    last_repeat_count = seen_keystrokes[_k]
+                else:
+                    last_repeat_count = 1
 
             elif isinstance(event, Terminus2CmdOutputObservation):
                 if event is initial_terminal_event:
@@ -377,7 +425,8 @@ class Terminus2Agent(Agent):
                 )
             else:
                 user_text = self._format_terminal_output(
-                    terminal_output, last_timed_out, last_keystrokes
+                    terminal_output, last_timed_out, last_keystrokes,
+                    last_repeat_count,
                 )
                 messages.append(
                     Message(role='user', content=[TextContent(text=user_text)])
@@ -471,16 +520,29 @@ class Terminus2Agent(Agent):
         return last_prefix + '\n'.join(screens)
 
     def _format_terminal_output(
-        self, terminal_output: str, timed_out: bool, keystrokes: str
+        self, terminal_output: str, timed_out: bool, keystrokes: str, repeat_count: int = 1
     ) -> str:
-        """Format terminal output for the next user message."""
+        """Format terminal output for the next user message.
+
+        ``repeat_count`` is how many times this exact command has now been run in the
+        episode. Above 1 we say so explicitly. The model already receives its own command
+        and the full output (verified over 54,939 observations: output is never empty,
+        median 1136 chars; and 99.8% of follow-on commands are echoed back inside the
+        first command's reply), yet it still re-issued an identical command in 79.3% of
+        stuck rollouts. So the missing ingredient is not the data but the inference, and
+        this states it outright rather than leaving it to be derived.
+        """
         if timed_out:
-            return TIMEOUT_TEMPLATE.format(
+            text = TIMEOUT_TEMPLATE.format(
                 command=keystrokes,
                 timeout_sec=COMMAND_EXEC_TIMEOUT,
                 terminal_state=self._limit_output_length(terminal_output),
             )
-        return self._limit_output_length(terminal_output)
+        else:
+            text = self._limit_output_length(terminal_output)
+        if repeat_count > 1:
+            text += REPEATED_COMMAND_NOTICE.format(n=repeat_count)
+        return text
 
     async def _call_llm_and_parse(
         self, messages: list[Message]
