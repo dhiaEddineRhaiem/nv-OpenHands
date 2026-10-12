@@ -71,7 +71,10 @@ class Message(BaseModel):
     generation_token_ids: list[int] | None = None
     generation_log_probs: list[float] | None = None
     # R3 (router replay): per-token expert routes, shape [tokens][moe_layers][topk]
-    routed_experts: list[list[list[int]]] | None = None
+    # Router Replay (R3) routes NeMo-RL attached to the model response: nested int lists, an
+    # opaque base64 envelope (router_replay.transport=inline) or an opaque object-store
+    # reference tag (transport=ray). Never interpreted here, only carried back on the next call.
+    routed_experts: list[list[list[int]]] | str | dict[str, Any] | None = None
 
     @property
     def contains_image(self) -> bool:
