@@ -9,7 +9,7 @@ from openhands.agenthub.codeact_agent.function_calling import (
     set_security_risk,
 )
 from openhands.agenthub.codeact_agent.tools import create_cmd_run_tool
-from openhands.agenthub.nemo_lenient import lenient_enabled, opencode_tools, recover_tool_calls
+from openhands.agenthub.nemo_lenient import lenient_enabled, opencode_tools, recover_tool_calls_and_content
 from openhands.agenthub.opencode_agent.tools.apply_patch import APPLY_PATCH_TOOL_NAME
 from openhands.agenthub.opencode_agent.tools.bash import create_cmd_run_tool
 from openhands.agenthub.opencode_agent.tools.edit import EditTool
@@ -65,17 +65,19 @@ def response_to_actions(
     assistant_msg = choice.message
 
     # NeMo lenient tool-call recovery (shared with CodeAct, gated by LENIENT_ON): when the
-    # server-side parser returned no tool_calls but the content clearly contains an intended
-    # call, synthesize real tool calls from it using the OpenCode tool table.
+    # server-side parser returned no tool_calls but the post-</think> content clearly contains
+    # an intended call, synthesize real tool calls from it using the OpenCode tool table and
+    # keep only the text before the call, as hermes does natively.
     if (
         (not (hasattr(assistant_msg, "tool_calls") and assistant_msg.tool_calls))
         and isinstance(getattr(assistant_msg, "content", None), str)
         and assistant_msg.content.strip()
         and lenient_enabled()
     ):
-        _recovered = recover_tool_calls(assistant_msg.content, opencode_tools())
+        _recovered, _content = recover_tool_calls_and_content(assistant_msg.content, opencode_tools())
         if _recovered:
             assistant_msg.tool_calls = _recovered
+            assistant_msg.content = _content
 
     # Check if both content and tool_calls are None
     has_content = assistant_msg.content is not None

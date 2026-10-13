@@ -22,7 +22,7 @@ from openhands.agenthub.codeact_agent.tools import (
     create_str_replace_editor_tool,
 )
 from openhands.agenthub.codeact_agent.tools.security_utils import RISK_LEVELS
-from openhands.agenthub.nemo_lenient import codeact_tools, lenient_enabled, recover_tool_calls
+from openhands.agenthub.nemo_lenient import codeact_tools, lenient_enabled, recover_tool_calls_and_content
 from openhands.core.exceptions import (
     FunctionCallNotExistsError,
     FunctionCallValidationError,
@@ -86,10 +86,11 @@ def response_to_actions(
 
     # NeMo lenient tool-call recovery (2026-09-13, gated; extended 2026-10-13): the
     # policy drifts into tool syntax the server-side hermes parser rejects
-    # ('<tool_call>' JSON inside <think>, bare JSON, <function=..>, <execute_bash>,
-    # <finish>, ...), leaving tool_calls empty while the content clearly contains
-    # an intended call. Synthesize real tool calls from it (see
-    # _nemo_recover_tool_calls for the recognised shapes).
+    # ('<tool_call>' with broken JSON, bare JSON, <function=..>, <execute_bash>,
+    # <finish>, ...), leaving tool_calls empty while the post-</think> content
+    # clearly contains an intended call. Synthesize real tool calls from it and
+    # keep only the text before the call, as hermes does (see
+    # _nemo_recover_tool_calls for the recognised shapes and the think rule).
     _msg0 = getattr(response.choices[0], 'message')
     if (
         (not (hasattr(_msg0, 'tool_calls') and _msg0.tool_calls))
@@ -97,9 +98,10 @@ def response_to_actions(
         and _msg0.content.strip()
         and _nemo_lenient_enabled()
     ):
-        _recovered = _nemo_recover_tool_calls(_msg0.content)
+        _recovered, _content = _nemo_recover_tool_calls(_msg0.content)
         if _recovered:
             _msg0.tool_calls = _recovered
+            _msg0.content = _content
 
     # Check if both content and tool_calls are None - this indicates context length has been hit
     has_content = assistant_msg.content is not None
@@ -402,7 +404,8 @@ def _nemo_lenient_enabled() -> bool:
 def _nemo_recover_tool_calls(content: str):
     """CodeAct entry point of the shared NeMo lenient tool-call recovery.
 
-    See openhands/agenthub/nemo_lenient.py for the recognised shapes and the per-agent
-    tool table (names, aliases, argument rules).
+    Returns ``(calls, content)``. See openhands/agenthub/nemo_lenient.py for the recognised
+    shapes, the post-</think> visibility rule and the per-agent tool table (names, aliases,
+    argument rules).
     """
-    return recover_tool_calls(content, codeact_tools())
+    return recover_tool_calls_and_content(content, codeact_tools())

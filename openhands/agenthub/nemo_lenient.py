@@ -16,6 +16,15 @@ diversified tool names too.
 Everything is gated by the LENIENT_ON flag file (or OH_LENIENT_TOOLCALLS=1), capped at
 NEMO_LENIENT_MAX_CALLS calls per message, and wrapped so that a recovery bug can never kill a
 rollout.
+
+Visibility rule (2026-10-13): recovery only looks at the text AFTER the first ``</think>``, i.e.
+exactly the region the server-side pipeline hands to its tool parser (vLLM's deepseek_r1 reasoning
+parser splits on ``</think>`` and hermes only sees the remainder). Text inside the think block is
+reasoning, never an action: recovering calls from there taught exp_080's policy within ~10 steps
+to put the whole call inside ``<think>...</think>`` and stop, a shape no stock reasoning+tool
+pipeline can execute. An unclosed think block is likewise not recoverable. When calls are
+recovered, the content is cut before the first recovered call (what hermes does natively) so the
+history never shows the call text twice.
 """
 
 from __future__ import annotations
@@ -31,6 +40,32 @@ from openhands.core.logger import openhands_logger as logger
 
 NEMO_LENIENT_MAX_CALLS = 2
 RISK_LEVELS = ('LOW', 'MEDIUM', 'HIGH')
+THINK_OPEN = '<think>'
+THINK_CLOSE = '</think>'
+_RE_DANGLING_OPENER = re.compile(r'(?:(?:<tool_calls?>|<function=[\w.-]+>|<invoke(?:\s+name="[\w.-]+")?\s*>)\s*)+\Z')
+
+
+def post_think_region(content: str) -> Optional[tuple[int, str]]:
+    """Return ``(offset, text)`` of the part of ``content`` a tool parser is allowed to see.
+
+    Mirrors vLLM's deepseek_r1 reasoning parser: everything up to the first ``</think>`` is
+    reasoning, the remainder is content. ``None`` when the think block is never closed (the whole
+    output is reasoning), the full text when it carries no think markup at all.
+    """
+    idx = content.find(THINK_CLOSE)
+    if idx != -1:
+        offset = idx + len(THINK_CLOSE)
+        return offset, content[offset:]
+    if THINK_OPEN in content:
+        return None
+    return 0, content
+
+
+def _content_before_call(content: str, cut: int) -> str:
+    """The assistant text kept once calls are recovered: what precedes the first call, minus a
+    dangling ``<tool_call>``/``<tool_calls>``/``<function=..>``/``<invoke>`` opener (hermes also
+    returns the text before the tag)."""
+    return _RE_DANGLING_OPENER.sub('', content[:cut])
 
 
 @dataclass(frozen=True)
@@ -573,17 +608,22 @@ def _coerce_args(tool: LenientTool, args: dict, table: _Table) -> Optional[dict]
     return out
 
 
-def _recover_impl(content: str, table: _Table, max_calls: int):
+def _recover_impl(content: str, table: _Table, max_calls: int) -> tuple[Optional[list], str]:
     from litellm import ChatCompletionMessageToolCall
 
+    region = post_think_region(content)
+    if region is None:
+        return None, content
+    offset, text = region
     candidates = []
     for detector in (_detect_json, _detect_function_tags, _detect_invoke, _detect_attr_calls,
                      _detect_cmd_attr, _detect_pseudo_xml):
-        candidates.extend(detector(content, table))
+        candidates.extend(detector(text, table))
     candidates.sort(key=lambda c: c[0])
     calls = []
     seen = set()
-    for _pos, tool, args in candidates:
+    first_pos = None
+    for pos, tool, args in candidates:
         args = _coerce_args(tool, args, table)
         if args is None:
             continue
@@ -591,6 +631,8 @@ def _recover_impl(content: str, table: _Table, max_calls: int):
         if key in seen:
             continue
         seen.add(key)
+        if first_pos is None:
+            first_pos = pos
         calls.append(
             ChatCompletionMessageToolCall(
                 id=f'nemo_lenient_{len(calls)}',
@@ -600,14 +642,21 @@ def _recover_impl(content: str, table: _Table, max_calls: int):
         )
         if len(calls) >= max_calls:
             break
-    return calls or None
+    if not calls:
+        return None, content
+    return calls, _content_before_call(content, offset + first_pos)
 
 
-def recover_tool_calls(content: str, tools: Sequence[LenientTool], max_calls: int = NEMO_LENIENT_MAX_CALLS):
+def recover_tool_calls_and_content(
+    content: str, tools: Sequence[LenientTool], max_calls: int = NEMO_LENIENT_MAX_CALLS
+) -> tuple[Optional[list], str]:
     """Recover tool calls the server-side parser rejected, from the raw assistant text.
 
-    Returns a litellm ChatCompletionMessageToolCall list or None. Shapes, merged by position in
-    the text: ``<tool_call>{json}</tool_call>`` and bare ``{"name": ..}`` objects (also
+    Returns ``(calls, content)``: a litellm ChatCompletionMessageToolCall list or None, and the
+    assistant content to keep -- unchanged when nothing is recovered, otherwise cut before the
+    first recovered call exactly as hermes does for a native ``<tool_call>``. Only the text after
+    the first ``</think>`` is searched (see the module docstring). Shapes, merged by position in
+    that text: ``<tool_call>{json}</tool_call>`` and bare ``{"name": ..}`` objects (also
     ``parameters`` / top-level arguments; an unterminated final-message JSON still yields its
     message), ``<function=NAME><parameter=K>V</parameter>``, ``<invoke name="NAME">`` with
     ``<parameter name>``/``<arg name>`` children (name optional), ``<tool_call name=.. k="v"/>``,
@@ -617,4 +666,9 @@ def recover_tool_calls(content: str, tools: Sequence[LenientTool], max_calls: in
         return _recover_impl(content, _Table(tools), max_calls)
     except Exception as exc:  # noqa: BLE001 -- recovery is best-effort by design
         logger.warning(f'[nemo_lenient] recovery skipped ({type(exc).__name__}: {exc})')
-        return None
+        return None, content
+
+
+def recover_tool_calls(content: str, tools: Sequence[LenientTool], max_calls: int = NEMO_LENIENT_MAX_CALLS):
+    """Calls-only form of :func:`recover_tool_calls_and_content`."""
+    return recover_tool_calls_and_content(content, tools, max_calls)[0]
