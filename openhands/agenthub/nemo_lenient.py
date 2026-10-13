@@ -42,7 +42,9 @@ NEMO_LENIENT_MAX_CALLS = 2
 RISK_LEVELS = ('LOW', 'MEDIUM', 'HIGH')
 THINK_OPEN = '<think>'
 THINK_CLOSE = '</think>'
-_RE_DANGLING_OPENER = re.compile(r'(?:(?:<tool_calls?>|<function=[\w.-]+>|<invoke(?:\s+name="[\w.-]+")?\s*>)\s*)+\Z')
+_RE_DANGLING_OPENER = re.compile(
+    r'(?:(?:<tool_calls?>|<tool_uses>|<tool_actions>|<function=[\w.-]+>|<invoke(?:\s+name="[\w.-]+")?\s*>)\s*)+\Z'
+)
 
 
 def post_think_region(content: str) -> Optional[tuple[int, str]]:
@@ -268,7 +270,11 @@ def opencode_tools() -> tuple[LenientTool, ...]:
 # Detectors (format-level, agent-independent)
 # ---------------------------------------------------------------------------
 _RE_FUNCTION = re.compile(r'<function=([\w.-]+)>(.*?)(?:</function>|(?=<function=)|\Z)', re.S)
-_RE_INVOKE = re.compile(r'<invoke(?:\s+name="([\w.-]+)")?\s*>(.*?)(?:</invoke>|\Z)', re.S)
+_RE_INVOKE = re.compile(
+    r'<(?:invoke|call)(?:\s+(?:name|engine|tool)="([\w.-]+)")?[^<>]*?>(.*?)(?:</(?:invoke|call)>|\Z)', re.S
+)
+_RE_TOOL_CALL_BLOCK = re.compile(r'<tool_call>(.*?)</tool_call>', re.S)
+_RE_TOOL_NAME_CHILD = re.compile(r'<tool_name>\s*([\w.-]+)\s*</tool_name>', re.S)
 _RE_PARAM_ANY = re.compile(
     r'<(?:parameter|arg)(?:=|\s+name=")([\w.-]+)"?\s*>(.*?)</(?:parameter|arg)>', re.S
 )
@@ -395,6 +401,9 @@ def _call_from_json_obj(obj, table: _Table):
         if args is None:
             args = {k: v for k, v in obj.items() if k not in ('name', 'tool', 'tool_name', 'type', 'id', 'function')}
     tool = table.canonical(name)
+    if tool is None and name is None and isinstance(args, dict):
+        # {"command": "...", "security_risk": "LOW"} without a name: infer from the argument names
+        tool = _tool_from_params(args, table)
     if tool is None:
         return None
     if isinstance(args, str):
@@ -494,14 +503,41 @@ def _detect_function_tags(content: str, table: _Table) -> list:
 def _detect_invoke(content: str, table: _Table) -> list:
     found = []
     for m in _RE_INVOKE.finditer(content):
-        args = _param_children(m.group(2))
+        body = m.group(2)
+        args = _param_children(body)
         tool = table.canonical(m.group(1)) if m.group(1) else _tool_from_params(args, table)
         if tool is None:
             continue
+        if not args or (tool.kind == 'message' and 'message' not in args):
+            # <invoke name="bash"><bash_command>..</bash_command>..</invoke>, <invoke engine="finish">text</invoke>
+            args = _args_from_tag_body(tool, body, table) or args
         if tool.kind == 'message':
             args = {'message': _clean_message(args.get('message', ''))}
         if args or tool.kind == 'message':
             found.append((m.start(), tool, args))
+    return found
+
+
+def _detect_tool_call_blocks(content: str, table: _Table) -> list:
+    """``<tool_call>`` blocks whose body is not JSON: ``<tool_name>X</tool_name>`` + parameters, or a
+    bare shell command (``<tool_call>ls -la /testbed</tool_call>``) for the command tool."""
+    found = []
+    command_tool = next((t for t in table.tools if t.kind == 'command'), None)
+    for m in _RE_TOOL_CALL_BLOCK.finditer(content):
+        body = m.group(1)
+        if body.lstrip().startswith('{') or '<invoke' in body or '<call' in body:
+            continue  # JSON and invoke bodies belong to the other detectors
+        named = _RE_TOOL_NAME_CHILD.search(body)
+        if named:
+            tool = table.canonical(named.group(1))
+            if tool is None:
+                continue
+            args = _args_from_tag_body(tool, _RE_TOOL_NAME_CHILD.sub('', body), table)
+            if args:
+                found.append((m.start(), tool, args))
+            continue
+        if command_tool is not None and '<' not in body and _looks_like_command(body, table):
+            found.append((m.start(), command_tool, {command_tool.raw_body_arg or 'command': body.strip()}))
     return found
 
 
@@ -616,8 +652,8 @@ def _recover_impl(content: str, table: _Table, max_calls: int) -> tuple[Optional
         return None, content
     offset, text = region
     candidates = []
-    for detector in (_detect_json, _detect_function_tags, _detect_invoke, _detect_attr_calls,
-                     _detect_cmd_attr, _detect_pseudo_xml):
+    for detector in (_detect_json, _detect_function_tags, _detect_invoke, _detect_tool_call_blocks,
+                     _detect_attr_calls, _detect_cmd_attr, _detect_pseudo_xml):
         candidates.extend(detector(text, table))
     candidates.sort(key=lambda c: c[0])
     calls = []
@@ -660,7 +696,10 @@ def recover_tool_calls_and_content(
     ``parameters`` / top-level arguments; an unterminated final-message JSON still yields its
     message), ``<function=NAME><parameter=K>V</parameter>``, ``<invoke name="NAME">`` with
     ``<parameter name>``/``<arg name>`` children (name optional), ``<tool_call name=.. k="v"/>``,
-    ``<bash command="..">``, and pseudo-XML blocks named after any tool of the table.
+    ``<bash command="..">``, and pseudo-XML blocks named after any tool of the table. OpenCode
+    additions (2026-10-13): ``<invoke|call name|engine="X">`` with named children such as
+    ``<bash_command>`` or a raw body, ``<tool_call><tool_name>X</tool_name>..``, nameless JSON
+    objects (tool inferred from the argument names) and a bare command inside ``<tool_call>``.
     """
     try:
         return _recover_impl(content, _Table(tools), max_calls)
