@@ -88,7 +88,7 @@ DATASET_TYPE = 'SWE-bench'
 # Maps instance_id -> (replay_events, initial_action) for replay-and-continue mode
 REPLAY_DATA: dict[str, tuple[list, MessageAction]] = {}
 
-MAX_RETRIES = 3
+MAX_RETRIES = 1  # NeMo 2026-10-13: wedged starts never recovered on retry (16/16 on exp_081); cap the waste
 
 ########################################
 # START Custom profiling code
