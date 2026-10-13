@@ -9,6 +9,7 @@ from openhands.agenthub.codeact_agent.function_calling import (
     set_security_risk,
 )
 from openhands.agenthub.codeact_agent.tools import create_cmd_run_tool
+from openhands.agenthub.nemo_lenient import lenient_enabled, opencode_tools, recover_tool_calls
 from openhands.agenthub.opencode_agent.tools.apply_patch import APPLY_PATCH_TOOL_NAME
 from openhands.agenthub.opencode_agent.tools.bash import create_cmd_run_tool
 from openhands.agenthub.opencode_agent.tools.edit import EditTool
@@ -62,6 +63,19 @@ def response_to_actions(
     assert len(response.choices) == 1, "Only one choice is supported for now"
     choice = response.choices[0]
     assistant_msg = choice.message
+
+    # NeMo lenient tool-call recovery (shared with CodeAct, gated by LENIENT_ON): when the
+    # server-side parser returned no tool_calls but the content clearly contains an intended
+    # call, synthesize real tool calls from it using the OpenCode tool table.
+    if (
+        (not (hasattr(assistant_msg, "tool_calls") and assistant_msg.tool_calls))
+        and isinstance(getattr(assistant_msg, "content", None), str)
+        and assistant_msg.content.strip()
+        and lenient_enabled()
+    ):
+        _recovered = recover_tool_calls(assistant_msg.content, opencode_tools())
+        if _recovered:
+            assistant_msg.tool_calls = _recovered
 
     # Check if both content and tool_calls are None
     has_content = assistant_msg.content is not None
