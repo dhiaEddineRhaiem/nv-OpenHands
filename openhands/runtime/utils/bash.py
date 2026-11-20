@@ -76,6 +76,7 @@ master fd, and a background reader thread) mirror OpenHands' V1
 import fcntl
 import json
 import os
+import shutil
 import pty
 import re
 import select
@@ -384,6 +385,33 @@ class BashSession:
             # (A bash whose stdin is a pty is already interactive; -i just makes
             # this explicit and matches OpenHands' own pty backend.)
             shell_argv = ["/bin/bash", "-i"]
+        # NEMO_NET_ISOLATE=1 (set by the Gym when `isolate_agent_network` is on): run the
+        # model's shell in a PRIVATE network namespace. The action server (this process)
+        # keeps the container's network so the Gym can still reach it; everything the model
+        # runs through this session gets "Network is unreachable" for anything but loopback.
+        # Why (SWE RL audit 2026-11-20): the training containers had full internet, and the
+        # policy learned to `git clone` the upstream repo, `pip download` newer releases
+        # and even fetch the SWE-smith dataset (gold patches) from Hugging Face, besides
+        # fork-storming a CPython build with `make -j`. Loopback is brought up so local
+        # test servers keep working (needs CAP_NET_ADMIN in the container: the Gym stops
+        # dropping it when this mode is on), then the shell drops SYS_ADMIN/NET_ADMIN/
+        # SYS_PTRACE/SYS_MODULE so model code cannot `nsenter` back into the host namespace.
+        # Verified in two task images (apptainer 1.4.5): github/pypi unreachable, 127.0.0.1
+        # bind+connect fine; `unshare`/`setpriv` come from util-linux, present in both.
+        if os.environ.get("NEMO_NET_ISOLATE") == "1" and shutil.which("unshare"):
+            lo_up = (
+                "ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || "
+                "python3 -c 'import socket,fcntl,struct;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
+                "fcntl.ioctl(s,0x8914,struct.pack(\"16sH14s\",b\"lo\",0x41,b\"\\0\"*14))' 2>/dev/null; "
+            )
+            drop = (
+                "exec setpriv --bounding-set=-sys_admin,-net_admin,-sys_ptrace,-sys_module "
+                if shutil.which("setpriv")
+                else "exec "
+            )
+            inner = lo_up + drop + " ".join(shlex.quote(a) for a in shell_argv)
+            shell_argv = ["unshare", "-n", "--", "/bin/sh", "-c", inner]
+            logger.info("NEMO_NET_ISOLATE=1: bash session runs in a private network namespace")
 
         # NOTE (memory limit): the original ran a ``TmuxMemoryMonitor`` thread
         # bounded by ``TMUX_MEMORY_LIMIT``. That machinery is tmux-specific and
