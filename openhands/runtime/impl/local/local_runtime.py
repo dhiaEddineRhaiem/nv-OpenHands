@@ -639,7 +639,16 @@ def _create_server(
     workspace_mount_path = temp_workspace
 
     # Find available ports
-    execution_server_port = find_available_tcp_port(*EXECUTION_SERVER_PORT_RANGE)
+    # NEMO PATCH port-race: pick+bind+HOLD the exec port atomically; the bound socket fd is
+    # inherited by the server (pass_fds + NEMO_UVICORN_FD) and served by uvicorn directly, so
+    # the port is never unbound between selection and serve -> no [Errno 98] on shared netns.
+    import socket as _nemo_socket
+    _nemo_sock = _nemo_socket.socket(_nemo_socket.AF_INET, _nemo_socket.SOCK_STREAM)
+    _nemo_sock.setsockopt(_nemo_socket.SOL_SOCKET, _nemo_socket.SO_REUSEADDR, 1)
+    _nemo_sock.bind(('0.0.0.0', 0))
+    _nemo_sock.listen(128)
+    _nemo_sock.set_inheritable(True)
+    execution_server_port = _nemo_sock.getsockname()[1]
     vscode_port = int(
         os.getenv('VSCODE_PORT') or str(find_available_tcp_port(*VSCODE_PORT_RANGE))
     )
@@ -690,6 +699,7 @@ def _create_server(
 
     logger.debug(f'Updated PATH for subprocesses: {env["PATH"]}')
 
+    env['NEMO_UVICORN_FD'] = str(_nemo_sock.fileno())  # NEMO PATCH port-race: hand held socket to server
     server_process = subprocess.Popen(  # noqa: S603
         cmd,
         stdout=subprocess.PIPE,
@@ -698,7 +708,12 @@ def _create_server(
         bufsize=1,
         env=env,
         cwd=code_repo_path,
+        pass_fds=(_nemo_sock.fileno(),),  # NEMO PATCH port-race
     )
+    try:
+        _nemo_sock.close()  # NEMO PATCH port-race: child inherited the fd; drop parent copy
+    except Exception:
+        pass
 
     log_thread_exit_event = threading.Event()
 

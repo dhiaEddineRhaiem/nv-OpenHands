@@ -38,7 +38,7 @@ from openhands_aci.utils.diff import get_diff
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from uvicorn import run
+from uvicorn import Config, Server, run  # NEMO PATCH port-race
 
 from openhands.core.config.mcp_config import MCPStdioServerConfig
 from openhands.core.exceptions import BrowserUnavailableException
@@ -313,16 +313,34 @@ class ActionExecutor:
                 max_memory_mb=self.max_memory_gb * 1024 if self.max_memory_gb else None,
             )
         else:
-            bash_session = BashSession(
-                work_dir=cwd or self._initial_cwd,
-                username=self.username,
-                no_change_timeout_seconds=int(
-                    os.environ.get('NO_CHANGE_TIMEOUT_SECONDS', 10)
-                ),
-                max_memory_mb=self.max_memory_gb * 1024 if self.max_memory_gb else None,
-            )
-            bash_session.initialize()
-            return bash_session
+            # NEMO PATCH bash-retry: retry the whole tmux-backed BashSession creation
+            # (new_session AND new_window) under high concurrency; jittered backoff.
+            import time as _nemo_time
+            import random as _nemo_random
+            _nemo_last = None
+            for _nemo_i in range(10):
+                bash_session = None
+                try:
+                    bash_session = BashSession(
+                        work_dir=cwd or self._initial_cwd,
+                        username=self.username,
+                        no_change_timeout_seconds=int(
+                            os.environ.get('NO_CHANGE_TIMEOUT_SECONDS', 10)
+                        ),
+                        max_memory_mb=self.max_memory_gb * 1024 if self.max_memory_gb else None,
+                    )
+                    bash_session.initialize()
+                    return bash_session
+                except Exception as _nemo_e:  # noqa: BLE001 - tmux flaky under load
+                    _nemo_last = _nemo_e
+                    logger.warning(f'[nemo bash-retry] _create_bash_session attempt {_nemo_i + 1}/10 failed: {_nemo_e!r}')
+                    try:
+                        if bash_session is not None:
+                            bash_session.close()
+                    except Exception:
+                        pass
+                    _nemo_time.sleep(min(0.8 * (_nemo_i + 1), 5.0) + _nemo_random.uniform(0.0, 1.5))
+            raise _nemo_last
 
     async def ainit(self):
         # bash needs to be initialized first
@@ -2816,4 +2834,10 @@ if __name__ == '__main__':
     if os.getenv('LOG_JSON', '0') in ('1', 'true', 'True'):
         log_config = get_uvicorn_json_log_config()
 
-    run(app, host='0.0.0.0', port=args.port, log_config=log_config, use_colors=False)
+    _nemo_fd = os.environ.get('NEMO_UVICORN_FD')  # NEMO PATCH port-race
+    if _nemo_fd:
+        import socket as _nemo_socket
+        _nemo_sock = _nemo_socket.socket(_nemo_socket.AF_INET, _nemo_socket.SOCK_STREAM, fileno=int(_nemo_fd))
+        Server(Config(app, log_config=log_config, use_colors=False)).run(sockets=[_nemo_sock])
+    else:
+        run(app, host='0.0.0.0', port=args.port, log_config=log_config, use_colors=False)

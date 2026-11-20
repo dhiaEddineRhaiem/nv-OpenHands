@@ -193,6 +193,8 @@ def set_dataset_type(dataset_name: str) -> str:
         DATASET_TYPE = 'SWE-bench_Multilingual'
     elif 'swe-bench-ext' in name_lower:
         DATASET_TYPE = 'swe-bench-ext'
+    elif 'harbor' in name_lower:  # NRL-harbor-patch
+        DATASET_TYPE = 'harbor'
     else:
         DATASET_TYPE = 'SWE-bench'
 
@@ -610,7 +612,7 @@ def get_config(
         tag_suffix = instance_id.split('-')[-1] if instance_id else ''
         base_container_image = f'mswebench/{container_name}:pr-{tag_suffix}'
     else:
-        use_swebench_official_image = DATASET_TYPE != 'SWE-Gym'
+        use_swebench_official_image = DATASET_TYPE not in ('SWE-Gym', 'harbor')  # NRL-harbor-patch
         base_container_image = get_instance_docker_image(
             instance['instance_id'],
             swebench_official_image=use_swebench_official_image,
@@ -1037,7 +1039,7 @@ source ~/.bashrc
         )
 
     # These dataset types operate directly in their repo dir, skipping the copy-to-workspace step.
-    SKIP_ENTRY_SCRIPT_TYPES = ('nv-internal-1', 'SWE-rebench-V2', 'SWE-Gym', 'R2E-Gym', 'swe-bench-ext')
+    SKIP_ENTRY_SCRIPT_TYPES = ('nv-internal-1', 'SWE-rebench-V2', 'SWE-Gym', 'R2E-Gym', 'swe-bench-ext', 'harbor')  # NRL-harbor-patch
 
     if DATASET_TYPE not in SKIP_ENTRY_SCRIPT_TYPES:
         action = CmdRunAction(command=f'source /swe_util/{entry_script_path}')
@@ -1100,6 +1102,31 @@ source ~/.bashrc
             f"Failed to deactivate and which python: {str(obs)}",
         )
 
+    if DATASET_TYPE == 'harbor':  # NRL-harbor-patch
+        # Harbor images keep the repo at a per-task workdir AND may bundle unrelated framework
+        # repos (e.g. /opt/nemo-rl). Pick the .git whose repo CONTAINS the task's base_commit
+        # (fallback: first non-framework repo, then /testbed) and symlink /testbed -> it, so
+        # workspace_path='/testbed' and complete_runtime's diff-against-base_commit both resolve.
+        _bc = str(instance.get('base_commit', '') or '')
+        _hb = CmdRunAction(command=(
+            'BC="' + _bc + '"; sel=""; '
+            'for d in $(find / -maxdepth 6 -type d -name .git 2>/dev/null | grep -avE "^/(proc|sys|dev)"); do '
+            '  r="${d%/.git}"; '
+            '  case "$r" in /opt/nemo-rl*|*aiccu-nemo-rl*|*/gym_shared/*|/openhands_setup*) continue;; esac; '
+            '  if [ -n "$BC" ] && git -C "$r" cat-file -e "${BC}^{commit}" 2>/dev/null; then sel="$r"; break; fi; '
+            '  if [ -z "$sel" ] || [ "$r" = /testbed ]; then sel="$r"; fi; '
+            'done; '
+            '[ -z "$sel" ] && sel=/testbed; '
+            'if [ "$sel" != "/testbed" ]; then rm -rf /testbed 2>/dev/null || true; ln -sfn "$sel" /testbed; fi; '
+            'source /testbed/.venv/bin/activate 2>/dev/null || true; '
+            '[ -f /opt/conda/etc/profile.d/conda.sh ] && . /opt/conda/etc/profile.d/conda.sh 2>/dev/null && conda activate testbed 2>/dev/null || true; '
+            'export PATH=/usr/local/bin:/usr/bin:/bin:$PATH; echo HARBOR_REPO=$(readlink -f /testbed); which python || which python3 || true'
+        ))
+        _hb.set_hard_timeout(300)
+        logger.info(_hb, extra={'msg_type': 'ACTION'})
+        _obs = runtime.run_action(_hb)
+        logger.info(_obs, extra={'msg_type': 'OBSERVATION'})
+
     action = CmdRunAction(command=f'cd {workspace_path}')
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
@@ -1110,7 +1137,7 @@ source ~/.bashrc
         f'Failed to cd to {workspace_path}: {str(obs)}',
     )
 
-    if DATASET_TYPE != "swe-bench-ext":
+    if DATASET_TYPE not in ("swe-bench-ext", "harbor"):  # NRL-harbor-patch
         # Deep-clean the git state so the agent cannot inspect commits past
         # the task's base_commit via local refs, tags, reflog, or dangling
         # objects. Remote access is blocked by removing remotes (below) and
@@ -1197,7 +1224,7 @@ source ~/.bashrc
             obs = runtime.run_action(action)
             logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
-    if DATASET_TYPE not in ('Multimodal', 'SWE-bench-Live', 'nv-internal-1', 'SWE-rebench', 'SWE-rebench-V2', 'SWE-bench_Multilingual', 'swe-bench-ext'):
+    if DATASET_TYPE not in ('Multimodal', 'SWE-bench-Live', 'nv-internal-1', 'SWE-rebench', 'SWE-rebench-V2', 'SWE-bench_Multilingual', 'swe-bench-ext', 'harbor'):  # NRL-harbor-patch
         # Only for non-multimodal datasets, we need to activate the testbed environment for Python
         # SWE-Bench multimodal datasets, SWE-bench-Live, nv-internal-1, and SWE-rebench are not using the testbed environment
         action = CmdRunAction(command='which python')
@@ -1231,7 +1258,7 @@ def _get_workspace_path(
         repo = instance.get("repo", "")
         repo_name = repo.split("/")[1] if "/" in repo else repo
         return f"/{repo_name}"
-    if DATASET_TYPE in ("SWE-Gym", "R2E-Gym"):
+    if DATASET_TYPE in ("SWE-Gym", "R2E-Gym", "harbor"):  # NRL-harbor-patch
         return "/testbed"
     return f"/workspace/{workspace_dir_name}"
 

@@ -1,20 +1,102 @@
+"""Drop-in replacement for OpenHands v0.62.0's tmux-based ``BashSession``.
+
+This module is a **behaviour-compatible** re-implementation of
+``openhands/runtime/utils/bash.py`` that drives a single persistent ``bash``
+attached to a **pty** (via :func:`pty.openpty`) instead of a tmux pane driven by
+``libtmux``.  It is meant to be copied over
+``openhands/runtime/utils/bash.py`` at setup time.
+
+Motivation
+----------
+Under high concurrency, ``libtmux.Server().new_session(...)`` intermittently
+raises ``LibTmuxException('server exited unexpectedly')``.  Those crashes are
+counted as failed rollouts and floor the SWE-GRPO reward.  Removing tmux from
+the hot path eliminates that failure mode entirely.
+
+Correctness contract
+---------------------
+RL rewards depend on the parsed command output / exit-code being identical to
+the original tmux implementation.  To guarantee that, we keep the original's
+PS1-metadata protocol and reuse its output-extraction helpers **verbatim**
+(``split_bash_commands``, ``escape_bash_special_chars``, ``_remove_command_prefix``,
+``_get_command_output``, ``_combine_outputs_between_matches``,
+``_handle_completed_command`` / ``_handle_nochange_timeout_command`` /
+``_handle_hard_timeout_command`` and the whole ``execute`` state machine).  Only
+the *transport* is swapped: tmux ``send-keys`` / ``capture-pane`` become pty
+writes and a background reader thread.
+
+The transport swap requires a handful of small, well-understood adaptations vs.
+the tmux code, each documented inline where it occurs. These were validated
+against real bash 5.2 over a pty on the deployment host:
+
+1. **Single-line PS1** (see the ``PS1`` class attribute). The upstream
+   multi-line metadata prompt makes bash/readline redraw the prompt on a real
+   pty, emitting a duplicate metadata block *before* the command output and
+   causing empty extraction. Collapsing it to one physical line removes the
+   redraw. The JSON fields are unchanged, so parsed metadata is identical.
+2. **Echo off** (termios ``ECHO`` cleared before spawning bash in ``initialize``,
+   re-asserted with ``stty -echo``). With echo suppressed the captured stream is
+   just the command's real output + the metadata prompt -- no typed-command echo
+   to strip -- and, crucially, the init command's literal PS1 string is not
+   echoed as a bogus metadata block (which otherwise floods the log with
+   "Failed to parse PS1 metadata" warnings). ``_remove_command_prefix`` stays as
+   a safety net in case a command re-enables echo. ``initialize`` also disables
+   readline completion (``bind 'set disable-completion on'``) so a literal TAB in
+   a heredoc self-inserts instead of triggering filename completion (which would
+   corrupt written files), and disables history expansion (``set +H``).
+3. **CR stripped at read time** (in the reader thread). A pty emits CRLF; the
+   whole buffer is kept CR-free so every marker search (especially
+   ``_clear_screen``'s ``rfind`` of the PS1 markers, which previously failed on
+   ``\r\n`` and wiped the buffer, injecting a spurious prompt) is reliable.
+   ``_get_pane_content`` additionally strips ANSI escape sequences so the text
+   matches tmux's ``capture-pane -p``.
+4. ``execute``'s completion check is gated on ``output_changed_since_command``.
+   tmux ``capture-pane`` is synchronous, so the original never observes the
+   pre-command prompt after sending; our reader thread is asynchronous, so a
+   completion check on the very first poll could otherwise match the *previous*
+   prompt (which ends in the PS1 END marker) and return empty output.  This is
+   exactly the guard OpenHands' own pty backend
+   (``software-agent-sdk`` ``terminal_session.py``) adds for the same reason.
+5. The ``endswith(PS1_END)`` completion fallback is additionally gated on the
+   initial prompt having genuinely scrolled off. With echo off there is no
+   command echo after the kept prompt block, so a bare ``endswith`` would fire on
+   that STALE block the instant a signal handler emits a newline -- completing an
+   interrupt/timeout recovery on the old prompt with empty output and the wrong
+   exit code. Interrupts and normal commands instead complete on a NEW prompt
+   block (count increase); the fallback is reserved for true history scroll-off.
+
+The tmux memory monitor (``TmuxMemoryMonitor``) is intentionally **dropped**;
+see the note in ``initialize``.
+
+The pty mechanics (openpty + a persistent interactive bash, a non-blocking
+master fd, and a background reader thread) mirror OpenHands' V1
+``SubprocessTerminal``.
+"""
+
+import fcntl
+import json
 import os
+import pty
 import re
+import select
+import shlex
 import signal
+import struct
+import termios
+import threading
 import time
-import uuid
+from collections import deque
 from enum import Enum
-from typing import Any, Set
+from typing import Any
 
 import bashlex
-import libtmux
 import psutil
-import threading
-import logging
+
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import CmdRunAction
 from openhands.events.observation import ErrorObservation
 from openhands.events.observation.commands import (
+    CMD_OUTPUT_PS1_BEGIN,
     CMD_OUTPUT_PS1_END,
     CmdOutputMetadata,
     CmdOutputObservation,
@@ -33,103 +115,31 @@ SU_TO_USER = os.getenv("SU_TO_USER", "true").lower() in (
     "on",
 )
 
+# Byte written to the pty to submit a line (Enter). bash's line discipline maps
+# it to a carriage return internally; keeping it '\n' matches typed input.
+ENTER = b"\n"
 
-class TmuxMemoryMonitor(threading.Thread):
-    def __init__(self, tmux_server, limit_mb, interval=2.0):
-        super().__init__(daemon=True)
-        self.server = tmux_server
-        self.limit_mb = limit_mb
-        self.limit_bytes = limit_mb * 1024 * 1024
-        self.interval = interval
-        self.running = True
-        print(f"[TmuxMemoryMonitor] initialized with limit: {self.limit_mb} MB", flush=True)
-
-    def _get_server_pid(self):
-        try:
-            pid_str = self.server.cmd("display-message", "-p", "#{pid}").stdout[0]
-            return int(pid_str)
-        except (IndexError, ValueError, Exception):
-            return None
-
-    def get_tree_memory(self, parent_pid):
-        total_mem = 0
-        try:
-            parent = psutil.Process(parent_pid)
-            procs = [parent] + parent.children(recursive=True)
-            for p in procs:
-                try:
-                    total_mem += p.memory_info().rss
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-        except psutil.NoSuchProcess:
-            return 0
-        return total_mem
-
-    def kill_inner_processes(self):
-        try:
-            # Loop through all sessions -> windows -> panes
-            for session in self.server.sessions:
-                for window in session.windows:
-                    for pane in window.panes:
-                        try:
-                            pane_pid_str = pane.cmd(
-                                "display-message", "-p", "#{pane_pid}"
-                            ).stdout[0]
-                            pane_pid = int(pane_pid_str)
-
-                            parent = psutil.Process(pane_pid)
-                            shell_proc = BashSession._find_shell_proc(parent)
-                            targets = shell_proc.children(recursive=True)
-                            if targets:
-                                print(
-                                    f"[TmuxMemoryMonitor] Killing {len(targets)} command processes in pane {pane.id} "
-                                    f"(shell PID: {shell_proc.pid}, keeping shell alive)",
-                                    flush=True,
-                                )
-                                for child in targets:
-                                    try:
-                                        child.kill()
-                                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                        pass
-
-                        except (psutil.NoSuchProcess, IndexError, ValueError):
-                            continue
-        except Exception as e:
-            print(f"[TmuxMemoryMonitor] Error killing panes: {e}", flush=True)
-
-    def run(self):
-        print(f"[TmuxMemoryMonitor] started. Limit: {self.limit_mb} MB", flush=True)
-        time.sleep(1)
-
-        server_pid = self._get_server_pid()
-        if not server_pid:
-            print("[TmuxMemoryMonitor] Could not determine Tmux Server PID. Monitor aborting.", flush=True)
-            return
-
-        while self.running:
-            used_bytes = self.get_tree_memory(server_pid)
-            used_mb = used_bytes / (1024 * 1024)
-
-            if used_bytes > self.limit_bytes:
-                print(
-                    f"[TmuxMemoryMonitor] MEMORY LIMIT EXCEEDED: {int(used_mb)}MB > {self.limit_mb}MB",
-                    flush=True,
-                )
-                print(
-                    "[TmuxMemoryMonitor] KILLING PROCESSES INSIDE TMUX (Server stays alive)...",
-                    flush=True,
-                )
-
-                self.kill_inner_processes()
-                time.sleep(10)
-
-            time.sleep(self.interval)
-
-    def stop(self):
-        self.running = False
+# Matches ANSI control sequences so that the text we hand to the PS1 parser is
+# escape-free, exactly like tmux's ``capture-pane -p`` output.  Covers CSI
+# sequences (colours, cursor moves, bracketed-paste toggles), OSC sequences
+# (title setting, terminated by BEL or ST) and the two-character C1 escapes.
+_ANSI_ESCAPE_RE = re.compile(
+    r"""
+    \x1b
+    (?:
+        \[ [0-?]* [ -/]* [@-~]           # CSI ... final byte
+      | \] .*? (?: \x07 | \x1b\\ )        # OSC ... (BEL | ST)
+      | [@-Z\\-_]                         # 7-bit C1 (Fe), e.g. ESC c, ESC =
+    )
+    """,
+    re.VERBOSE | re.DOTALL,
+)
 
 
 def split_bash_commands(commands: str) -> list[str]:
+    # NOTE: copied verbatim from the original bash.py so command-splitting
+    # behaviour (and therefore the "cannot execute multiple commands" path) is
+    # byte-for-byte identical.
     if not commands.strip():
         return [""]
     try:
@@ -189,6 +199,11 @@ def split_bash_commands(commands: str) -> list[str]:
 def escape_bash_special_chars(command: str) -> str:
     r"""Escapes characters that have different interpretations in bash vs python.
     Specifically handles escape sequences like \;, \|, \&, etc.
+
+    NOTE: copied verbatim from the original bash.py.  OpenHands' own pty backend
+    applies this exact transform before writing to the pty (see
+    ``terminal_session.py``), so keeping it here yields identical bytes on the
+    wire as the tmux path did.
     """
     if command.strip() == "":
         return ""
@@ -281,9 +296,49 @@ def _remove_command_prefix(command_output: str, command: str) -> str:
 
 
 class BashSession:
+    """Persistent bash session over a pty (no tmux / no libtmux).
+
+    Public interface matches the original tmux ``BashSession`` exactly:
+    ``__init__(work_dir, username=None, no_change_timeout_seconds=30,
+    max_memory_mb=None)``, ``initialize()``, ``execute(action)``, ``close()``,
+    and the ``cwd`` property.
+    """
+
     POLL_INTERVAL = 0.05
     HISTORY_LIMIT = 10_000
-    PS1 = CmdOutputMetadata.to_ps1_prompt()
+
+    # SINGLE-LINE PS1 metadata prompt.
+    #
+    # The upstream ``CmdOutputMetadata.to_ps1_prompt()`` embeds newlines in the
+    # prompt string. On a real pty that multi-line prompt makes bash/readline
+    # *redraw* the prompt after accepting the input line, so a single command
+    # produces TWO metadata blocks (an intermediate re-render before the output
+    # plus the real one after it). The tmux capture never saw that because tmux
+    # rendered to its own virtual screen. The duplicate intermediate block made
+    # ``execute()`` complete early and extract an empty region (empty rewards).
+    #
+    # Collapsing the prompt to a single physical line removes the redraw, so
+    # exactly one metadata block is emitted per prompt. The JSON *fields* are
+    # byte-identical to ``to_ps1_prompt()`` (same keys/values), so
+    # ``from_ps1_match`` yields identical metadata and the parsed observation is
+    # unchanged -- only the prompt whitespace differs, and that is never part of
+    # the observation content.
+    PS1 = (
+        "\n"
+        + CMD_OUTPUT_PS1_BEGIN.strip()
+        + json.dumps(
+            {
+                "pid": "$!",
+                "exit_code": "$?",
+                "username": r"\u",
+                "hostname": r"\h",
+                "working_dir": r"$(pwd)",
+                "py_interpreter_path": r'$(which python 2>/dev/null || echo "")',
+            }
+        ).replace('"', r"\"")
+        + CMD_OUTPUT_PS1_END.strip()
+        + "\n"
+    )
 
     def __init__(
         self,
@@ -297,113 +352,399 @@ class BashSession:
         self.username = username
         self._initialized = False
         self.max_memory_mb = max_memory_mb
+        # Kept for attribute-compatibility with callers/tests that reference it.
+        # The tmux memory monitor is dropped in the pty backend (see initialize).
         self.memory_monitor = None
 
+        # pty transport state
+        self.process = None
+        self._master_fd: int | None = None
+        self._reader_thread: threading.Thread | None = None
+        # Line-per-item circular buffer (mirrors tmux history-limit truncation).
+        # Slightly larger than HISTORY_LIMIT to match tmux keeping ~10,001 lines.
+        self._buffer: deque[str] = deque(maxlen=self.HISTORY_LIMIT + 50)
+        self._buffer_lock = threading.Lock()
+        self._closed = False
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
     def initialize(self) -> None:
-        self.server = libtmux.Server()
+        # Build the shell command exactly like the original tmux backend so the
+        # runtime user / login semantics are unchanged.
         _shell_command = "/bin/bash"
         if SU_TO_USER and self.username in list(
             filter(None, [RUNTIME_USERNAME, "root", "openhands"])
         ):
-            # This starts a non-login (new) shell for the given user
+            # This starts a login shell for the given user (interactive on a pty).
             _shell_command = f"su {self.username} -"
+            shell_argv = shlex.split(_shell_command)
+        else:
+            # ``-i`` forces interactive mode so PROMPT_COMMAND/PS1 take effect.
+            # (A bash whose stdin is a pty is already interactive; -i just makes
+            # this explicit and matches OpenHands' own pty backend.)
+            shell_argv = ["/bin/bash", "-i"]
 
-        # FIXME: we will introduce memory limit using sysbox-runc in coming PR
-        # # otherwise, we are running as the CURRENT USER (e.g., when running LocalRuntime)
-        # if self.max_memory_mb is not None:
-        #     window_command = (
-        #         f'prlimit --as={self.max_memory_mb * 1024 * 1024} {_shell_command}'
-        #     )
-        # else:
-        window_command = _shell_command
-
+        # NOTE (memory limit): the original ran a ``TmuxMemoryMonitor`` thread
+        # bounded by ``TMUX_MEMORY_LIMIT``. That machinery is tmux-specific and
+        # is intentionally NOT ported here to minimise risk (the original's
+        # ``prlimit``-based path was already commented out / FIXME). ``max_memory_mb``
+        # is therefore accepted but not enforced. If per-session memory capping is
+        # needed later, add a lightweight psutil monitor over ``self.process`` pgid.
         logger.debug(
-            f"Initializing bash session in {self.work_dir} with command: {window_command}"
-        )
-        session_name = f"openhands-{self.username}-{uuid.uuid4()}"
-        self.session = self.server.new_session(
-            session_name=session_name,
-            start_directory=self.work_dir,  # This parameter is supported by libtmux
-            kill_session=True,
-            x=1000,
-            y=1000,
+            f"Initializing pty bash session in {self.work_dir} with command: {shell_argv}"
         )
 
-        tmux_memory_limit = int(os.getenv("TMUX_MEMORY_LIMIT", "32768"))
-        self.memory_monitor = TmuxMemoryMonitor(self.server, limit_mb=tmux_memory_limit)
-        self.memory_monitor.start()
+        # Create the pty. The child gets the slave; we keep the master.
+        master_fd, slave_fd = pty.openpty()
 
-        # Set history limit to a large number to avoid losing history
-        # https://unix.stackexchange.com/questions/43414/unlimited-history-in-tmux
-        self.session.set_option("history-limit", str(self.HISTORY_LIMIT), global_=True)
-        self.session.history_limit = self.HISTORY_LIMIT
-        # We need to create a new pane because the initial pane's history limit is (default) 2000
-        _initial_window = self.session.active_window
-        self.window = self.session.new_window(
-            window_name="bash",
-            window_shell=window_command,
-            start_directory=self.work_dir,  # This parameter is supported by libtmux
-        )
-        self.pane = self.window.active_pane
-        logger.debug(f"pane: {self.pane}; history_limit: {self.session.history_limit}")
-        _initial_window.kill()
+        # Give the pty a large window (matching the original tmux x=1000, y=1000)
+        # so readline does not wrap long command echoes, which would otherwise
+        # perturb the captured text vs. the tmux baseline.
+        try:
+            winsize = struct.pack("HHHH", 1000, 1000, 0, 0)  # rows, cols, xpix, ypix
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+        except Exception:
+            logger.debug("Failed to set pty winsize; continuing", exc_info=True)
 
-        # Configure bash to use simple PS1 and disable PS2
-        self.pane.send_keys(
-            f'export PROMPT_COMMAND=\'export PS1="{self.PS1}"\'; export PS2=""'
+        # Disable terminal echo BEFORE bash starts, so the initialization command
+        # (which contains the literal PS1 metadata string) is not echoed back into
+        # the stream. Without this the echoed literal PS1 -- unexpanded, with
+        # \"-escaped quotes -- is scanned as a bogus metadata block and floods the
+        # log with "Failed to parse PS1 metadata" warnings during init. Echo stays
+        # off for real commands too, giving clean output extraction. (A command
+        # that re-enables echo is still handled: _remove_command_prefix strips a
+        # single echoed command line.)
+        try:
+            _attrs = termios.tcgetattr(slave_fd)
+            _attrs[3] &= ~termios.ECHO  # lflag
+            termios.tcsetattr(slave_fd, termios.TCSANOW, _attrs)
+        except Exception:
+            logger.debug("Failed to disable pty echo; continuing", exc_info=True)
+
+        import subprocess  # local import: only needed to spawn the shell
+
+        try:
+            self.process = subprocess.Popen(
+                shell_argv,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=self.work_dir,
+                env=os.environ.copy(),
+                text=False,  # bytes I/O
+                bufsize=0,
+                start_new_session=True,  # own session/pgid for signal handling
+                close_fds=True,
+            )
+        finally:
+            # Parent must close its copy of the slave fd.
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
+
+        self._master_fd = master_fd
+        # Non-blocking master so both the reader thread and _write_all can use
+        # select() for readiness / backpressure.
+        flags = fcntl.fcntl(self._master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(self._master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        # Background reader: continuously drains the pty into the line buffer.
+        self._reader_thread = threading.Thread(
+            target=self._read_output_continuously, daemon=True
         )
-        time.sleep(0.1)  # Wait for command to take effect
+        self._reader_thread.start()
+
+        self._initialized = True
+
+        # Configure bash to use our PS1 metadata prompt and disable PS2, and turn
+        # OFF terminal echo. With echo off, the command the agent typed is not
+        # echoed back into the pty stream, so the captured content is just the
+        # command's real output followed by the metadata prompt -- no echo to
+        # strip and no chance of a duplicated echo confusing extraction.
+        # (_remove_command_prefix stays as a safety net in case a command
+        # re-enables echo via stty/reset.)
+        # Also make the interactive shell treat our sent bytes literally:
+        #   * ``bind 'set disable-completion on'`` -> TAB self-inserts instead of
+        #     triggering filename completion. Without this, a literal TAB in a
+        #     heredoc (Go, Makefiles, indented code) is completed against the cwd
+        #     and the written file is corrupted.
+        #   * ``set +H`` -> disable history expansion so a literal '!' is not
+        #     rewritten (matches OpenHands' own pty backend).
+        self._send_keys_checked(
+            f"export PROMPT_COMMAND='export PS1=\"{self.PS1}\"'; export PS2=\"\"; "
+            f"stty -echo 2>/dev/null; bind 'set disable-completion on' 2>/dev/null; "
+            f"set +H 2>/dev/null",
+            enter=True,
+        )
+
+        # Wait until the metadata prompt is actually rendered before clearing,
+        # so the first real command sees exactly one initial PS1 block. (tmux was
+        # synchronous; the pty reader is not, so we must wait explicitly.)
+        if not self._wait_for_ps1(timeout=10.0):
+            logger.warning(
+                "PS1 metadata prompt did not appear during bash initialization"
+            )
         self._clear_screen()
 
-        # Store the last command for interactive input handling
+        # Store the last command state for interactive input handling.
         self.prev_status: BashCommandStatus | None = None
         self.prev_output: str = ""
-        self._closed: bool = False
+        self._closed = False
         logger.debug(f"Bash session initialized with work dir: {self.work_dir}")
 
-        # Maintain the current working directory
+        # Maintain the current working directory (updated from PS1 metadata).
         self._cwd = os.path.abspath(self.work_dir)
         self._initialized = True
 
     def __del__(self) -> None:
         """Ensure the session is closed when the object is destroyed."""
-        if self.memory_monitor:
-            self.memory_monitor.stop()
-        self.close()
-
-    def _get_pane_content(self) -> str:
-        """Capture the current pane content and update the buffer."""
-        content = "\n".join(
-            map(
-                # avoid double newlines
-                lambda line: line.rstrip(),
-                self.pane.cmd("capture-pane", "-J", "-pS", "-").stdout,
-            )
-        )
-        return content
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def close(self) -> None:
-        """Clean up the session."""
-        if self.memory_monitor:
-            self.memory_monitor.stop()
+        """Clean up the pty session and child process."""
         if self._closed:
             return
-        self.session.kill()
         self._closed = True
+        try:
+            if self.process is not None:
+                # Try a graceful exit first.
+                try:
+                    self._write_all(b"exit\n")
+                except Exception:
+                    pass
+                try:
+                    self.process.wait(timeout=2)
+                except Exception:
+                    # Escalate to the process group.
+                    try:
+                        os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                        self.process.wait(timeout=1)
+                    except Exception:
+                        try:
+                            os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                        except Exception:
+                            pass
+        except Exception:
+            logger.debug("Error while closing pty bash session", exc_info=True)
+        finally:
+            # Closing the master fd makes the reader thread's read() fail/EOF.
+            if self._master_fd is not None:
+                try:
+                    os.close(self._master_fd)
+                except OSError:
+                    pass
+                self._master_fd = None
+            if self._reader_thread is not None and self._reader_thread.is_alive():
+                self._reader_thread.join(timeout=1)
+            self.process = None
 
     @property
     def cwd(self) -> str:
         return self._cwd
 
-    @staticmethod
-    def _find_shell_proc(pane_proc: psutil.Process) -> psutil.Process:
-        """Walk down through single-child shell wrappers (e.g. su → bash)
-        to find the actual shell process.
+    # ------------------------------------------------------------------ #
+    # pty I/O core
+    # ------------------------------------------------------------------ #
+    def _read_output_continuously(self) -> None:
+        """Drain the pty master into the line buffer until the shell exits."""
+        fd = self._master_fd
+        if fd is None:
+            return
+        try:
+            while True:
+                if self.process is not None and self.process.poll() is not None:
+                    break
+                if self._master_fd is None:
+                    break
+                try:
+                    r, _, _ = select.select([fd], [], [], 0.1)
+                except (OSError, ValueError):
+                    break
+                if not r:
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except (BlockingIOError, InterruptedError):
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break  # EOF
+                # Strip carriage returns at read time. A pty emits CRLF; tmux's
+                # capture-pane returned CR-free text. Removing CR here also means
+                # the whole buffer (and every marker search in it) is clean '\n'
+                # text -- critical for _clear_screen's rfind of the PS1 markers,
+                # which previously failed on '\r\n' and wiped the buffer.
+                text = chunk.decode("utf-8", errors="replace").replace("\r", "")
+                with self._buffer_lock:
+                    self._add_text_to_buffer(text)
+        except Exception:
+            logger.debug("pty reader thread terminated", exc_info=True)
 
-        Returns the deepest shell process in the chain. If the pane_proc
-        itself is the shell, returns it unchanged.
+    def _add_text_to_buffer(self, text: str) -> None:
+        """Append text to the buffer, keeping one logical line per deque item.
+
+        Mirrors OpenHands' V1 SubprocessTerminal so the maxlen truncation drops
+        whole oldest lines, matching tmux's history-limit behaviour.
+        Caller must hold ``self._buffer_lock``.
         """
-        shell_proc = pane_proc
+        if self._buffer and not self._buffer[-1].endswith("\n"):
+            combined_text = self._buffer[-1] + text
+            self._buffer.pop()
+        else:
+            combined_text = text
+
+        lines = combined_text.split("\n")
+        for line in lines[:-1]:
+            self._buffer.append(line + "\n")
+        if lines[-1]:  # keep trailing partial line (if any)
+            self._buffer.append(lines[-1])
+
+    def _write_all(self, data: bytes) -> None:
+        """Write all bytes to the pty master, respecting flow control.
+
+        On Linux the pty write correctly returns EAGAIN / short-writes when the
+        line-discipline input buffer is full (e.g. large heredocs), so we loop
+        with select() until every byte is delivered. This is what lets big
+        multi-line file writes go through without a manual pacing delay.
+        """
+        if self._master_fd is None:
+            raise RuntimeError("pty bash session is not initialized")
+        view = memoryview(data)
+        total = 0
+        n = len(data)
+        while total < n:
+            try:
+                _, w, _ = select.select([], [self._master_fd], [], 1.0)
+            except (OSError, ValueError):
+                raise RuntimeError("pty master is not writable")
+            if not w:
+                continue
+            try:
+                written = os.write(self._master_fd, view[total:])
+                total += written
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError as e:
+                logger.error(f"Failed to write to pty: {e}")
+                raise
+
+    def _is_special_key(self, command: str) -> bool:
+        """Check if the command is a special key (e.g. ``C-c``)."""
+        # Special keys are of the form C-<key>
+        _command = command.strip()
+        return _command.startswith("C-") and len(_command) == 3
+
+    def _encode_keys(self, keys: str) -> bytes:
+        """Translate a key spec into the bytes to write to the pty.
+
+        - ``C-<x>`` -> the corresponding control byte (Ctrl+X), so Ctrl+C
+          delivers SIGINT via the pty line discipline, matching tmux ``send-keys``.
+        - anything else -> the literal text, with newlines normalised to ``\\n``.
+        """
+        if self._is_special_key(keys):
+            ch = keys.strip()[-1].upper()
+            return bytes([ord(ch) & 0x1F])
+        raw = keys.encode("utf-8", "ignore")
+        # Normalise line endings so embedded newlines (heredocs, multi-line
+        # commands) submit lines exactly as typed input would.
+        raw = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        return raw
+
+    def _send_keys_checked(self, keys: str, enter: bool = True) -> None:
+        """Send keys to the pty; append Enter when requested.
+
+        Replaces the tmux ``send-keys`` helper of the same name. For a special
+        key (``C-c``/``C-z``/``C-d``) the caller passes ``enter=False`` and we
+        emit only the control byte, exactly like the original.
+        """
+        payload = self._encode_keys(keys)
+        if payload:
+            self._write_all(payload)
+        if enter:
+            self._write_all(ENTER)
+
+    def _wait_for_ps1(self, timeout: float = 10.0) -> bool:
+        """Block until a PS1 metadata block is visible (init-time only)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if CmdOutputMetadata.matches_ps1_metadata(self._get_pane_content()):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _get_pane_content(self) -> str:
+        """Return the captured session output, normalised like tmux capture-pane.
+
+        Replaces tmux ``capture-pane -J -pS -``.  We strip carriage returns and
+        ANSI escape sequences (tmux renders these to its virtual screen and its
+        capture is escape-free) and rstrip each line -- matching the original's
+        ``"\\n".join(line.rstrip() for line in capture_pane.stdout)`` so the PS1
+        regex, prompt detection and command-echo removal behave identically.
+        """
+        with self._buffer_lock:
+            raw = "".join(self._buffer)
+        raw = raw.replace("\r", "")
+        raw = _ANSI_ESCAPE_RE.sub("", raw)
+        content = "\n".join(line.rstrip() for line in raw.split("\n"))
+        return content
+
+    def _clear_screen(self) -> None:
+        """Reset the buffer to just the most recent PS1 block.
+
+        Equivalent to the original's tmux ``C-l`` + ``clear-history``: afterwards
+        ``_get_pane_content`` returns only the current prompt, so the next
+        command's ``initial_ps1_count`` is 1.  We keep everything from the last
+        ``###PS1JSON###`` marker onward (its trailing ``###PS1END###`` line is what
+        prompt-detection keys off).  If no prompt is buffered yet, nudge bash to
+        render one.
+        """
+        need_prompt_nudge = False
+        # Use the bare markers (no surrounding newlines). CMD_OUTPUT_PS1_BEGIN is
+        # '\n###PS1JSON###\n', but our single-line prompt is '###PS1JSON###{...}',
+        # so we must match on the stripped token, not the newline-wrapped one.
+        begin = CMD_OUTPUT_PS1_BEGIN.strip()  # '###PS1JSON###'
+        end = CMD_OUTPUT_PS1_END.strip()  # '###PS1END###'
+        with self._buffer_lock:
+            if not self._buffer:
+                need_prompt_nudge = True
+            else:
+                # CR is already gone (stripped at read time); strip ANSI so the
+                # marker search is reliable.
+                data = _ANSI_ESCAPE_RE.sub("", "".join(self._buffer))
+                start_idx = data.rfind(begin)
+                end_idx = data.rfind(end)
+                if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
+                    # Keep only the most recent metadata block; prepend a newline
+                    # so it stays on its own line for the ^ anchor in the PS1 regex.
+                    tail = "\n" + data[start_idx:]
+                    self._buffer.clear()
+                    self._buffer.append(tail)
+                else:
+                    self._buffer.clear()
+                    need_prompt_nudge = True
+        if need_prompt_nudge:
+            try:
+                self._write_all(ENTER)  # ask bash to re-render a prompt
+            except Exception:
+                pass
+
+    def _ready_for_next_command(self) -> None:
+        """Reset the content buffer for a new command."""
+        self._clear_screen()
+
+    def _find_shell_proc(self, root_proc: psutil.Process) -> psutil.Process:
+        """Walk down through single-child shell wrappers (e.g. su -> bash) to
+        find the actual shell process. Returns the deepest shell in the chain.
+
+        NOTE: copied verbatim from the original bash.py.
+        """
+        shell_proc = root_proc
         while True:
             kids = shell_proc.children(recursive=False)
             if not kids:
@@ -413,62 +754,41 @@ class BashSession:
                 name = first.name()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 break
-            if len(kids) == 1 and name in ('bash', 'sh', 'zsh', 'fish', 'dash'):
+            if len(kids) == 1 and name in ("bash", "sh", "zsh", "fish", "dash"):
                 shell_proc = first
             else:
                 break
         return shell_proc
 
-    def _is_special_key(self, command: str) -> bool:
-        """Check if the command is a special key."""
-        # Special keys are of the form C-<key>
-        _command = command.strip()
-        return _command.startswith("C-") and len(_command) == 3
+    def _kill_command_processes(self) -> bool:
+        """SIGKILL the foreground command processes, keeping the shell alive.
 
-    def _send_keys_checked(self, keys: str, enter: bool = True) -> None:
-        """Send keys to the tmux pane and log any errors.
-
-        Unlike pane.send_keys(), this method checks the return value of
-        the underlying tmux command and logs errors instead of silently
-        swallowing them.
-        """
-        result = self.pane.cmd("send-keys", keys)
-        if result.stderr:
-            logger.error(
-                f"tmux send-keys {keys!r} FAILED: {result.stderr} "
-                f"(returncode={result.returncode}, pane_id={self.pane.pane_id})"
-            )
-        if enter:
-            result = self.pane.cmd("send-keys", "Enter")
-            if result.stderr:
-                logger.error(
-                    f"tmux send-keys Enter FAILED: {result.stderr} "
-                    f"(returncode={result.returncode})"
-                )
-
-    def _kill_pane_processes(self) -> bool:
-        """Kill foreground command processes in the tmux pane via SIGKILL.
-
-        The pane process tree is: pane_init (su) → shell (bash) → commands.
-        We must kill only the commands, NOT the shell, or the pane dies.
-        Walks down to the deepest shell and kills its children.
+        pty analog of the original's ``_kill_pane_processes``: instead of looking
+        up the tmux pane pid, we start from ``self.process`` (the ``bash``/``su``
+        we spawned), walk down to the real shell and kill only its children.
         """
         try:
-            pane_pid_str = self.pane.cmd(
-                "display-message", "-p", "#{pane_pid}"
-            ).stdout[0]
-            pane_pid = int(pane_pid_str)
-            print(f"[BASH_SIGNAL] Pane PID: {pane_pid}", flush=True)
+            if self.process is None:
+                return False
+            root_pid = self.process.pid
+            print(f"[BASH_SIGNAL] Root PID: {root_pid}", flush=True)
 
-            proc = psutil.Process(pane_pid)
+            proc = psutil.Process(root_pid)
             shell_proc = self._find_shell_proc(proc)
 
             targets = shell_proc.children(recursive=True)
             if not targets:
-                print(f"[BASH_SIGNAL] Shell PID {shell_proc.pid} has no command children", flush=True)
+                print(
+                    f"[BASH_SIGNAL] Shell PID {shell_proc.pid} has no command children",
+                    flush=True,
+                )
                 return False
 
-            print(f"[BASH_SIGNAL] Shell: {shell_proc.pid} ({shell_proc.name()}) → killing {len(targets)} processes: {[(t.pid, t.name()) for t in targets]}", flush=True)
+            print(
+                f"[BASH_SIGNAL] Shell: {shell_proc.pid} ({shell_proc.name()}) -> killing "
+                f"{len(targets)} processes: {[(t.pid, t.name()) for t in targets]}",
+                flush=True,
+            )
             for target in targets:
                 try:
                     target.kill()
@@ -476,23 +796,22 @@ class BashSession:
                     pass
 
             psutil.wait_procs(targets, timeout=3)
-            print(f"[BASH_SIGNAL] Kill complete", flush=True)
+            print("[BASH_SIGNAL] Kill complete", flush=True)
             return True
-        except (psutil.NoSuchProcess, IndexError, ValueError) as e:
+        except (psutil.NoSuchProcess, ValueError) as e:
             print(f"[BASH_SIGNAL] Kill failed: {type(e).__name__}: {e}", flush=True)
             return False
         except Exception as e:
-            print(f"[BASH_SIGNAL] Kill failed unexpectedly: {type(e).__name__}: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
+            print(
+                f"[BASH_SIGNAL] Kill failed unexpectedly: {type(e).__name__}: {e}",
+                flush=True,
+            )
             return False
 
-    def _clear_screen(self) -> None:
-        """Clear the tmux pane screen and history."""
-        self.pane.send_keys("C-l", enter=False)
-        time.sleep(0.1)
-        self.pane.cmd("clear-history")
-
+    # ------------------------------------------------------------------ #
+    # Output extraction (copied verbatim from the original -- operates on
+    # captured text + session state, transport-agnostic).
+    # ------------------------------------------------------------------ #
     def _get_command_output(
         self,
         command: str,
@@ -500,14 +819,7 @@ class BashSession:
         metadata: CmdOutputMetadata,
         continue_prefix: str = "",
     ) -> str:
-        """Get the command output with the previous command output removed.
-
-        Args:
-            command: The command that was executed.
-            raw_command_output: The raw output from the command.
-            metadata: The metadata object to store prefix/suffix in.
-            continue_prefix: The prefix to add to the command output if it's a continuation of the previous command.
-        """
+        """Get the command output with the previous command output removed."""
         # remove the previous command output from the new output if any
         if self.prev_output:
             command_output = raw_command_output.removeprefix(self.prev_output)
@@ -642,28 +954,13 @@ class BashSession:
             metadata=metadata,
         )
 
-    def _ready_for_next_command(self) -> None:
-        """Reset the content buffer for a new command."""
-        # Clear the current content
-        self._clear_screen()
-
     def _combine_outputs_between_matches(
         self,
         pane_content: str,
         ps1_matches: list[re.Match],
         get_content_before_last_match: bool = False,
     ) -> str:
-        """Combine all outputs between PS1 matches.
-
-        Args:
-            pane_content: The full pane content containing PS1 prompts and command outputs
-            ps1_matches: List of regex matches for PS1 prompts
-            get_content_before_last_match: when there's only one PS1 match, whether to get
-                the content before the last PS1 prompt (True) or after the last PS1 prompt (False)
-
-        Returns:
-            Combined string of all outputs between matches
-        """
+        """Combine all outputs between PS1 matches (verbatim from original)."""
         if len(ps1_matches) == 1:
             if get_content_before_last_match:
                 # The command output is the content before the last PS1 prompt
@@ -685,6 +982,9 @@ class BashSession:
         logger.debug(f"COMBINED OUTPUT: {combined_output}")
         return combined_output
 
+    # ------------------------------------------------------------------ #
+    # Command execution -- state machine kept faithful to the original.
+    # ------------------------------------------------------------------ #
     def execute(self, action: CmdRunAction) -> CmdOutputObservation | ErrorObservation:
         """Execute a command in the bash session."""
         if not self._initialized:
@@ -697,7 +997,7 @@ class BashSession:
 
         print(f"COMMAND: {command}")
         print(f"IS INPUT: {is_input}")
-        print(f"================================================")
+        print("================================================")
 
         # If the previous command is not completed, we need to check if the command is empty
         if self.prev_status not in {
@@ -721,11 +1021,17 @@ class BashSession:
         # Check if the command is a single command or multiple commands
         splited_commands = split_bash_commands(command)
         if len(splited_commands) > 1:
+            # Extracted to a local so the f-string contains no backslash
+            # (keeps the error text byte-identical to the original while
+            # remaining compilable on Python < 3.12 as well).
+            _provided_commands = "\n".join(
+                f"({i + 1}) {cmd}" for i, cmd in enumerate(splited_commands)
+            )
             return ErrorObservation(
                 content=(
-                    f"ERROR: Cannot execute multiple commands at once.\n"
-                    f"Please run each command separately OR chain them into a single command via && or ;\n"
-                    f"Provided commands:\n{'\n'.join(f'({i + 1}) {cmd}' for i, cmd in enumerate(splited_commands))}"
+                    "ERROR: Cannot execute multiple commands at once.\n"
+                    "Please run each command separately OR chain them into a single command via && or ;\n"
+                    f"Provided commands:\n{_provided_commands}"
                 )
             )
 
@@ -766,8 +1072,12 @@ class BashSession:
                 BashCommandStatus.NO_CHANGE_TIMEOUT,
             }
             and not last_pane_output.rstrip().endswith(
-                CMD_OUTPUT_PS1_END.rstrip()
+                CMD_OUTPUT_PS1_END.strip()
             )  # prev command is not completed
+            # NOTE: .strip() (not .rstrip()) -- our single-line prompt ends with
+            # '}###PS1END###' (no '\n' before the marker), whereas
+            # CMD_OUTPUT_PS1_END.rstrip() keeps a leading '\n'. .strip() matches
+            # both the single-line and the original multi-line prompt shapes.
             and not is_input
             and command != ""  # not input and not empty command
         ):
@@ -801,12 +1111,13 @@ class BashSession:
                 hidden=getattr(action, "hidden", False),
             )
 
-        # Send actual command/inputs to the pane
+        # Send actual command/inputs to the pty
         is_interrupt_signal = (
             is_input
             and self._is_special_key(command)
             and command.strip() in ("C-c", "C-z", "C-d")
         )
+        sent_command = command != ""
         if command != "":
             is_special_key = self._is_special_key(command)
             if is_input:
@@ -843,6 +1154,14 @@ class BashSession:
             ps1_matches = CmdOutputMetadata.matches_ps1_metadata(cur_pane_output)
             current_ps1_count = len(ps1_matches)
 
+            # pty adaptation: only treat the session as "changed since we sent
+            # the command" once new bytes have arrived. The tmux backend read
+            # synchronously so it never observed the pre-command prompt; our
+            # reader thread is async, so without this guard the first poll could
+            # match the previous prompt (which ends in PS1_END) and wrongly
+            # return empty output. Matches OpenHands' own pty terminal_session.
+            output_changed_since_command = cur_pane_output != initial_pane_output
+
             if cur_pane_output != last_pane_output:
                 last_pane_output = cur_pane_output
                 last_change_time = time.time()
@@ -850,11 +1169,36 @@ class BashSession:
 
             # 1) Execution completed:
             # Condition 1: A new prompt has appeared since the command started.
-            # Condition 2: The prompt count hasn't increased (potentially because the initial one scrolled off),
-            # BUT the *current* visible pane ends with a prompt, indicating completion.
-            if (
+            # Condition 2: The prompt count hasn't increased because the initial
+            # prompt scrolled off the history buffer, BUT the current pane ends
+            # with a prompt.
+            #
+            # pty-specific guard on Condition 2: because echo is OFF, there is no
+            # command echo pushing content past the kept prompt block. That kept
+            # block already ends with the PS1 END marker, so a bare
+            # ``endswith(PS1_END)`` would fire the instant any stray byte (e.g. the
+            # newline a signal handler emits) makes output_changed true -- before
+            # the real new prompt renders -- completing on the STALE prompt with
+            # empty output and the previous exit code. This was the interrupt/
+            # timeout-recovery corruption. We therefore only trust Condition 2 when
+            # the initial prompt has genuinely scrolled off (is no longer present in
+            # the pane); otherwise completion must come from a NEW prompt block
+            # (count increase), which is what actually happens on interrupt (the
+            # post-interrupt prompt) and on every normal command.
+            #
+            # .strip() (not .rstrip()): our single-line prompt ends with
+            # '}###PS1END###' with no '\n' before the marker, so the newline-prefixed
+            # CMD_OUTPUT_PS1_END.rstrip() would never match.
+            _initial_stripped = initial_pane_output.strip()
+            initial_prompt_scrolled_off = bool(
+                _initial_stripped and _initial_stripped not in cur_pane_output
+            )
+            if (not sent_command or output_changed_since_command) and (
                 current_ps1_count > initial_ps1_count
-                or cur_pane_output.rstrip().endswith(CMD_OUTPUT_PS1_END.rstrip())
+                or (
+                    cur_pane_output.rstrip().endswith(CMD_OUTPUT_PS1_END.strip())
+                    and initial_prompt_scrolled_off
+                )
             ):
                 return self._handle_completed_command(
                     command,
@@ -888,8 +1232,8 @@ class BashSession:
                         f"All {MAX_SIGNAL_RETRIES} signal retries exhausted. "
                         f"Escalating to SIGKILL via PID."
                     )
-                    killed = self._kill_pane_processes()
-                    print(f"[BASH_SIGNAL] _kill_pane_processes returned: {killed}", flush=True)
+                    killed = self._kill_command_processes()
+                    print(f"[BASH_SIGNAL] _kill_command_processes returned: {killed}", flush=True)
                     if killed:
                         last_change_time = time.time()
 
